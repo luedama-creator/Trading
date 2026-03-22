@@ -1,0 +1,405 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  Search FB – Failed Breakdown su E-mini S&P 500
+//  Pine Script v6  |  Compatibile con tutti i timeframe
+//  Ottimizzato per 3 min e 15 min su ES / MES
+//
+//  CONCETTI CHIAVE
+//  ───────────────────────────────────────────────────────────────────────────
+//  Minimo Significativo (Significant Low / SL):
+//    Minimo pivot dove almeno N barre a sinistra e N barre a destra
+//    presentano un low più alto. Rappresenta un livello di supporto
+//    rilevante che il mercato ha "rispettato".
+//
+//  Failed Breakdown (FB):
+//    1. Il prezzo scende sotto un Minimo Significativo  → breakdown
+//    2. Entro una finestra temporale definita, il prezzo recupera
+//       sopra quel livello                             → breakdown fallito
+//    3. I trader short intrappolati alimentano la rialzista  → entry long
+//
+//  PARAMETRI DI DEFAULT (ES futures, RTH)
+//  ───────────────────────────────────────────────────────────────────────────
+//  Stop  : N tick sotto il minimo assoluto del breakdown
+//  Target: Stop × R:R ratio
+//  Sessione: 08:30–16:00 ET (Regular Trading Hours)
+// ════════════════════════════════════════════════════════════════════════════
+//@version=6
+strategy("Search FB – Failed Breakdown",
+         shorttitle              = "Search FB",
+         overlay                 = true,
+         initial_capital         = 100000,
+         default_qty_type        = strategy.fixed,
+         default_qty_value       = 1,
+         commission_type         = strategy.commission.cash_per_contract,
+         commission_value        = 2.05,
+         slippage                = 1,
+         pyramiding              = 0,
+         process_orders_on_close = false,
+         calc_on_order_fills     = false,
+         max_lines_count         = 500,
+         max_labels_count        = 500)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  I N P U T S
+// ════════════════════════════════════════════════════════════════════════════
+
+var string G_SL  = "📍 Minimi Significativi (Significant Lows)"
+var string G_FB  = "⚡ Failed Breakdown"
+var string G_RM  = "🎯 Risk Management"
+var string G_SS  = "🕐 Sessione"
+var string G_VIS = "🎨 Visuals"
+
+// ── Minimi Significativi ─────────────────────────────────────────────────────
+i_pivLeft  = input.int   (5,   "Barre sinistra pivot",
+             minval=1, maxval=50, group=G_SL,
+             tooltip="Numero di barre a sinistra del candidato minimo, tutte con low più alto.\nValore più alto = minimi più 'importanti' (meno segnali, più affidabili).")
+
+i_pivRight = input.int   (3,   "Barre destra pivot (conferma)",
+             minval=1, maxval=50, group=G_SL,
+             tooltip="Barre a destra necessarie per confermare il pivot.\nAttenzione: introduce un ritardo – il livello appare i_pivRight barre dopo il minimo effettivo.")
+
+i_maxLows  = input.int   (5,   "Numero massimo minimi attivi",
+             minval=1, maxval=10, group=G_SL,
+             tooltip="Quanti Minimi Significativi tenere attivi contemporaneamente.\nQuelli più vecchi vengono eliminati automaticamente.")
+
+i_minGap   = input.float (2.0, "Gap minimo tra livelli (punti)",
+             minval=0.25, step=0.25, group=G_SL,
+             tooltip="Se due minimi sono distanti meno di questo valore, il più nuovo non viene aggiunto.\nEvita livelli doppi nella stessa area di prezzo.")
+
+// ── Failed Breakdown ─────────────────────────────────────────────────────────
+i_bkdClose = input.bool  (true, "Breakdown richiede CLOSE sotto il minimo",
+             group=G_FB,
+             tooltip="ON  → Il prezzo deve CHIUDERE sotto il livello per attivare il breakdown (più selettivo).\nOFF → Basta che il Low (wick) scenda sotto il livello.")
+
+i_recClose = input.bool  (true, "Recupero richiede CLOSE sopra il minimo",
+             group=G_FB,
+             tooltip="ON  → Il segnale FB scatta solo se il prezzo CHIUDE sopra il livello (più conservativo).\nOFF → Basta che il High (wick) risalga sopra il livello (segnale anticipato).")
+
+i_maxBars  = input.int   (8,   "Finestra temporale recupero (barre)",
+             minval=2, maxval=200, group=G_FB,
+             tooltip="Il prezzo deve recuperare sopra il livello entro questo numero di barre.\nSe la finestra scade senza recupero → breakdown reale, il livello viene rimosso.")
+
+// ── Risk Management ──────────────────────────────────────────────────────────
+i_slTicks  = input.int   (4,   "Tick aggiuntivi Stop (sotto BD Low)",
+             minval=1, maxval=200, group=G_RM,
+             tooltip="Stop Loss = minimo assoluto raggiunto durante il breakdown − (N × tick size).\nPer ES: 4 tick = 1 punto = $50/contratto aggiuntivi sotto il minimo del BD.")
+
+i_rrRatio  = input.float (2.0, "Risk / Reward Ratio",
+             minval=0.5, maxval=20.0, step=0.5, group=G_RM,
+             tooltip="Target = entry + (entry − stop) × R:R.\nEsempio: stop a 4 punti → target a 8 punti con R:R = 2.")
+
+i_tickSz   = input.float (0.25,"Tick Size",
+             minval=0.01, group=G_RM,
+             tooltip="ES e MES futures: 0.25 punti per tick.\nNon modificare se si opera su ES/MES.")
+
+// ── Sessione ─────────────────────────────────────────────────────────────────
+i_useSession = input.bool   (true,         "Filtra per sessione RTH",  group=G_SS,
+               tooltip="Se attivo, i segnali vengono generati SOLO durante la sessione RTH.\nFuori sessione i livelli vengono tracciati ma non si aprono trade.")
+i_session    = input.session("0830-1600",  "Sessione (formato HH:MM)", group=G_SS)
+i_tz         = input.string ("America/New_York", "Fuso orario",        group=G_SS)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+i_showLines = input.bool  (true,                   "Mostra linee Minimi Significativi", group=G_VIS)
+i_showBG    = input.bool  (true,                   "Sfondo durante il Breakdown",       group=G_VIS)
+i_showLbls  = input.bool  (true,                   "Mostra etichette prezzo",           group=G_VIS)
+i_showTable = input.bool  (true,                   "Mostra pannello informazioni",      group=G_VIS)
+i_colSL     = input.color (color.new(#2962FF, 15), "Colore linee Minimi Sig.",          group=G_VIS)
+i_colFB     = input.color (color.lime,             "Colore segnale FB",                 group=G_VIS)
+i_colBD     = input.color (color.new(color.red,85),"Colore sfondo Breakdown",           group=G_VIS)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S E S S I O N E
+// ════════════════════════════════════════════════════════════════════════════
+inSession = not i_useSession or not na(time(timeframe.period, i_session, i_tz))
+
+// ════════════════════════════════════════════════════════════════════════════
+//  M I N I M I   S I G N I F I C A T I V I
+// ════════════════════════════════════════════════════════════════════════════
+//  ta.pivotlow() restituisce il valore del pivot low confermato i_pivRight
+//  barre fa. Se non vi è pivot, restituisce na.
+// ─────────────────────────────────────────────────────────────────────────────
+pivLow = ta.pivotlow(low, i_pivLeft, i_pivRight)
+
+var array<float> sl_lvl  = array.new<float>(0)   // Prezzi dei minimi
+var array<int>   sl_bar  = array.new<int>  (0)   // Bar index effettivo del minimo
+var array<line>  sl_line = array.new<line> (0)   // Linee orizzontali
+
+// ── Aggiungi il pivot appena confermato ──────────────────────────────────────
+if not na(pivLow)
+    bool isDup = false
+    int  sz    = array.size(sl_lvl)
+
+    // Controlla duplicati entro il gap minimo
+    if sz > 0
+        for i = 0 to sz - 1
+            if math.abs(array.get(sl_lvl, i) - pivLow) < i_minGap
+                isDup := true
+                break
+
+    if not isDup
+        int pivBar = bar_index - i_pivRight   // Barra reale (con ritardo)
+
+        // Inserisci in testa (più recente = indice 0)
+        array.unshift(sl_lvl, pivLow)
+        array.unshift(sl_bar, pivBar)
+
+        // Disegna la linea orizzontale tratteggiata
+        newLine = line.new(
+             x1    = pivBar,
+             y1    = pivLow,
+             x2    = bar_index,
+             y2    = pivLow,
+             xloc  = xloc.bar_index,
+             color = i_colSL,
+             style = line.style_dashed,
+             width = 1)
+        array.unshift(sl_line, newLine)
+
+        // Etichetta piccola con il livello
+        if i_showLbls
+            label.new(
+                 x         = pivBar,
+                 y         = pivLow,
+                 text      = str.tostring(pivLow, "#.##"),
+                 xloc      = xloc.bar_index,
+                 style     = label.style_label_right,
+                 color     = color.new(#2962FF, 65),
+                 textcolor = color.white,
+                 size      = size.tiny)
+
+        // Elimina i livelli più vecchi oltre il massimo
+        while array.size(sl_lvl) > i_maxLows
+            line.delete(array.pop(sl_line))
+            array.pop(sl_lvl)
+            array.pop(sl_bar)
+
+// ── Estendi le linee verso destra ad ogni barra ──────────────────────────────
+if i_showLines and array.size(sl_line) > 0
+    for i = 0 to array.size(sl_line) - 1
+        line.set_x2(array.get(sl_line, i), bar_index)
+
+// ── Funzione: rimuove un livello cercandolo per valore di prezzo ─────────────
+//   (più robusta dell'uso dell'indice, che cambia con array.unshift)
+f_removeLevel(float lvl) =>
+    if array.size(sl_lvl) > 0
+        for i = 0 to array.size(sl_lvl) - 1
+            if math.abs(array.get(sl_lvl, i) - lvl) < i_tickSz
+                line.delete(array.remove(sl_line, i))
+                array.remove(sl_bar, i)
+                array.remove(sl_lvl, i)
+                break
+
+// ════════════════════════════════════════════════════════════════════════════
+//  F A I L E D   B R E A K D O W N  –  M A C C H I N A   A   S T A T I
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  STATO 0 (inBD = false): Osserva se un prezzo rompe sotto un SL
+//  STATO 1 (inBD = true) : Attende il recupero sopra il livello rotto
+//                           oppure lo scadere della finestra temporale
+// ─────────────────────────────────────────────────────────────────────────────
+var bool  inBD    = false   // Flag: siamo in fase di breakdown?
+var float bdLevel = na      // Livello del Minimo Significativo violato
+var float bdLow   = na      // Minimo assoluto raggiunto durante il BD
+var int   bdBar   = na      // Barra in cui è iniziato il breakdown
+
+// Prezzi da confrontare (in base alla modalità scelta dall'utente)
+float bkdPrice = i_bkdClose ? close : low    // Per rilevare il breakdown
+float recPrice = i_recClose ? close : high   // Per rilevare il recupero
+
+// ── STATO 0: Ricerca breakdown ────────────────────────────────────────────────
+if inSession and not inBD and array.size(sl_lvl) > 0
+    float nearestViolated = na
+
+    for i = 0 to array.size(sl_lvl) - 1
+        float lvl = array.get(sl_lvl, i)
+        // Il prezzo è sceso SOTTO questo livello?
+        if bkdPrice < lvl
+            // Traccia il livello più alto tra quelli violati
+            // (quello "più vicino" al prezzo → il più significativo in quel momento)
+            if na(nearestViolated) or lvl > nearestViolated
+                nearestViolated := lvl
+
+    // Entra in stato breakdown
+    if not na(nearestViolated)
+        inBD    := true
+        bdLevel := nearestViolated
+        bdLow   := low
+        bdBar   := bar_index
+
+// ── STATO 1: Gestione breakdown attivo ───────────────────────────────────────
+if inBD
+    bdLow := math.min(bdLow, low)   // Aggiorna il minimo assoluto del BD
+
+    // TIMEOUT: il prezzo non ha recuperato → è un breakdown reale
+    // Il livello viene rimosso dal tracking (ora è resistenza, non supporto)
+    if bar_index - bdBar >= i_maxBars
+        f_removeLevel(bdLevel)
+        inBD    := false
+        bdLevel := na
+        bdLow   := na
+        bdBar   := na
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S E G N A L E   F B   &   A P E R T U R A   T R A D E
+// ════════════════════════════════════════════════════════════════════════════
+//  Condizioni per il segnale FB:
+//    1. Siamo in stato breakdown (inBD = true)
+//    2. Il prezzo ha recuperato sopra il livello violato (recPrice >= bdLevel)
+//    3. Nessuna posizione aperta
+//    4. Siamo nella sessione operativa
+// ─────────────────────────────────────────────────────────────────────────────
+bool noPos    = strategy.position_size == 0
+bool fbSignal = inBD and recPrice >= bdLevel and noPos and inSession
+
+if fbSignal
+    // ── Calcolo prezzi di Stop e Target ──────────────────────────────────────
+    float entryPx = close
+    float stopPx  = bdLow - (i_slTicks * i_tickSz)       // Sotto il BD Low
+    float riskPts = entryPx - stopPx                     // Rischio in punti
+    float tpPx    = entryPx + riskPts * i_rrRatio        // Target R:R
+
+    // ── Ordine di entrata ─────────────────────────────────────────────────────
+    strategy.entry("FB Long", strategy.long, comment="FB")
+    strategy.exit ("FB Exit", from_entry="FB Long",
+                   stop           = stopPx,
+                   limit          = tpPx,
+                   comment_profit = "TP",
+                   comment_loss   = "SL")
+
+    // ── Etichetta sul grafico con dettagli del trade ──────────────────────────
+    if i_showLbls
+        int   riskTick = math.round(riskPts / i_tickSz)
+        label.new(
+             x         = bar_index,
+             y         = low,
+             text      = "⚡ FB\nNiv: "    + str.tostring(bdLevel, "#.##") +
+                         "\nEntry: " + str.tostring(entryPx, "#.##") +
+                         "\nSL: "   + str.tostring(stopPx,  "#.##") +
+                         "\nTP: "   + str.tostring(tpPx,    "#.##") +
+                         "\nRisk: " + str.tostring(riskTick) + " tk",
+             xloc      = xloc.bar_index,
+             style     = label.style_label_up,
+             color     = color.new(i_colFB, 10),
+             textcolor = color.black,
+             size      = size.small)
+
+    // ── Rimuovi il livello consumato dal tracking ─────────────────────────────
+    f_removeLevel(bdLevel)
+
+    // ── Reset dello stato ─────────────────────────────────────────────────────
+    inBD    := false
+    bdLevel := na
+    bdLow   := na
+    bdBar   := na
+
+// ════════════════════════════════════════════════════════════════════════════
+//  V I S U A L S
+// ════════════════════════════════════════════════════════════════════════════
+
+// Sfondo colorato durante la fase di breakdown
+bgcolor(i_showBG and inBD ? i_colBD : na, title="Zona Breakdown")
+
+// Freccia verde sotto la barra del segnale FB
+plotshape(fbSignal,
+          title     = "Failed Breakdown Signal",
+          location  = location.belowbar,
+          style     = shape.triangleup,
+          color     = i_colFB,
+          size      = size.normal,
+          text      = "FB",
+          textcolor = color.black)
+
+// Linea orizzontale al prezzo di entrata durante la posizione aperta
+plot(strategy.position_size > 0 ? strategy.position_avg_price : na,
+     title     = "Entry Price",
+     color     = color.new(color.yellow, 0),
+     linewidth  = 1,
+     style      = plot.style_linebr)
+
+// ── Pannello informazioni (tabella in alto a destra) ─────────────────────────
+if i_showTable and barstate.islast
+    var table infoTable = table.new(
+         position   = position.top_right,
+         columns    = 2,
+         rows       = 8,
+         bgcolor    = color.new(color.black, 75),
+         border_color = color.new(color.gray, 50),
+         border_width = 1)
+
+    // Header
+    table.cell(infoTable, 0, 0, "SEARCH FB",
+         text_color=color.white, text_size=size.small,
+         bgcolor=color.new(#2962FF, 30), text_halign=text.align_center)
+    table.cell(infoTable, 1, 0, timeframe.period + " min",
+         text_color=color.white, text_size=size.small,
+         bgcolor=color.new(#2962FF, 30), text_halign=text.align_center)
+
+    // Stato attuale
+    string bdStatus = inBD ?
+         "⚠️ BREAKDOWN (" + str.tostring(bar_index - bdBar) + "/" + str.tostring(i_maxBars) + " barre)" :
+         (strategy.position_size > 0 ? "✅ IN TRADE" : "👁 In attesa")
+    color  bdColor  = inBD ? color.red : (strategy.position_size > 0 ? color.green : color.gray)
+
+    table.cell(infoTable, 0, 1, "Stato",       text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, bdStatus,      text_color=bdColor,      text_size=size.tiny)
+
+    // Livello in breakdown
+    table.cell(infoTable, 0, 2, "Livello BD",  text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 2,
+         inBD ? str.tostring(bdLevel, "#.##") : "—",
+         text_color=color.yellow, text_size=size.tiny)
+
+    // Minimi attivi
+    int   nLvl = array.size(sl_lvl)
+    table.cell(infoTable, 0, 3, "Minimi attivi", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, str.tostring(nLvl) + " / " + str.tostring(i_maxLows),
+         text_color=color.white, text_size=size.tiny)
+
+    // Ultimi 3 livelli
+    table.cell(infoTable, 0, 4, "Ultimi livelli SL", text_color=color.silver, text_size=size.tiny)
+    string lvlStr = ""
+    if nLvl > 0
+        for i = 0 to math.min(nLvl - 1, 2)
+            lvlStr := lvlStr + str.tostring(array.get(sl_lvl, i), "#.##")
+            if i < math.min(nLvl - 1, 2)
+                lvlStr := lvlStr + " | "
+    else
+        lvlStr := "—"
+    table.cell(infoTable, 1, 4, lvlStr, text_color=color.aqua, text_size=size.tiny)
+
+    // Parametri principali
+    table.cell(infoTable, 0, 5, "Pivot L/R", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 5,
+         str.tostring(i_pivLeft) + " / " + str.tostring(i_pivRight),
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 6, "Max barre BD", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 6, str.tostring(i_maxBars), text_color=color.white, text_size=size.tiny)
+
+    table.cell(infoTable, 0, 7, "R:R / SL tick", text_color=color.silver, text_size=size.tiny)
+    table.cell(infoTable, 1, 7,
+         str.tostring(i_rrRatio, "#.#") + " / " + str.tostring(i_slTicks),
+         text_color=color.white, text_size=size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  A L E R T   C O N D I T I O N S
+// ════════════════════════════════════════════════════════════════════════════
+
+// Alert 1: Segnale di entrata Failed Breakdown
+alertcondition(fbSignal,
+     title   = "Search FB – Segnale Failed Breakdown",
+     message = "⚡ FAILED BREAKDOWN su {{ticker}} [{{interval}}]\n" +
+               "Close: {{close}}\n" +
+               "Verifica entry, SL e target sul grafico.")
+
+// Alert 2: Breakdown iniziato (in attesa di recupero)
+alertcondition(inBD and not inBD[1],
+     title   = "Search FB – Breakdown in corso",
+     message = "⚠️ Breakdown su {{ticker}} [{{interval}}]\n" +
+               "Prezzo sceso sotto Minimo Significativo.\n" +
+               "In attesa del recupero (Failed BD)...")
+
+// Alert 3: Breakdown confermato (finestra scaduta, livello rimosso)
+alertcondition(not inBD and inBD[1] and not fbSignal,
+     title   = "Search FB – Breakdown confermato (FB fallito)",
+     message = "❌ Breakdown REALE su {{ticker}} [{{interval}}]\n" +
+               "Il prezzo NON ha recuperato – livello rimosso.")
