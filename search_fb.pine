@@ -337,14 +337,14 @@ if strategy.position_size == 0 and strategy.position_size[1] < 0
 
 // ── Invalidazione FB: prezzo scende sotto bdLow originale ────────────────────
 if not na(lastFBLabel) and not na(lastFBBdLow) and low < lastFBBdLow
-    label.set_bgcolor   (lastFBLabel, i_colInvalid)
+    label.set_color     (lastFBLabel, i_colInvalid)
     label.set_textcolor (lastFBLabel, color.white)
     lastFBLabel := na
     lastFBBdLow := na
 
 // ── Invalidazione FBO: prezzo sale sopra boHigh originale ────────────────────
 if not na(lastFBOLabel) and not na(lastFBOBoHigh) and high > lastFBOBoHigh
-    label.set_bgcolor   (lastFBOLabel, i_colInvalid)
+    label.set_color     (lastFBOLabel, i_colInvalid)
     label.set_textcolor (lastFBOLabel, color.white)
     lastFBOLabel  := na
     lastFBOBoHigh := na
