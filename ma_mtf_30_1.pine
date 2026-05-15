@@ -1,0 +1,382 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  MA Multi-Timeframe – Strategia Medie Mobili 30m / 1m
+//  Pine Script v6  |  Chart consigliato: 1 minuto
+//
+//  CONCETTI CHIAVE
+//  ───────────────────────────────────────────────────────────────────────────
+//  Timeframe 30 min (HTF – Filtro Trend):
+//    Determina la direzione operativa del mercato attraverso le medie mobili.
+//    ● Bullish : MA Veloce > MA Lenta  [opzionale: prezzo > MA Trend]
+//    ● Bearish : MA Veloce < MA Lenta  [opzionale: prezzo < MA Trend]
+//
+//  Timeframe 1 min (LTF – Segnali Entrata, timeframe corrente del chart):
+//    Genera segnali di ingresso tramite crossover di medie mobili.
+//    ● Long  : MA Veloce incrocia ▲ MA Lenta  (solo se HTF Bullish)
+//    ● Short : MA Veloce incrocia ▼ MA Lenta  (solo se HTF Bearish)
+//
+//  Risk Management:
+//    ● Stop Loss   : entry ± ATR × moltiplicatore SL                (sempre attivo)
+//    ● Take Profit : entry ± ATR × moltiplicatore SL × R:R          (se no trailing)
+//    ● Trailing    : segue il prezzo a distanza ATR × molt. trail    (opzionale)
+//    ● Exit Cross  : chiude la posizione al crossover inverso LTF    (opzionale)
+// ════════════════════════════════════════════════════════════════════════════
+//@version=6
+strategy("MA Multi-Timeframe – 30m/1m",
+         shorttitle              = "MA MTF 30/1",
+         overlay                 = true,
+         initial_capital         = 100000,
+         default_qty_type        = strategy.fixed,
+         default_qty_value       = 1,
+         commission_type         = strategy.commission.cash_per_contract,
+         commission_value        = 2.05,
+         slippage                = 1,
+         pyramiding              = 0,
+         process_orders_on_close = false,
+         calc_on_order_fills     = false,
+         max_lines_count         = 500,
+         max_labels_count        = 500)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  I N P U T S
+// ════════════════════════════════════════════════════════════════════════════
+
+var string G_HTF = "📊 Timeframe 30 min – Filtro Trend (HTF)"
+var string G_LTF = "⚡ Timeframe Entrata – Segnali (LTF)"
+var string G_RM  = "🎯 Risk Management"
+var string G_SS  = "🕐 Sessione"
+var string G_VIS = "🎨 Visualizzazione"
+
+// ── HTF (30 min) ──────────────────────────────────────────────────────────
+htf_tf           = input.timeframe("30",      "Timeframe Trend (HTF)",                group = G_HTF)
+htf_fast_type    = input.string("EMA",        "MA Veloce – Tipo",                     group = G_HTF,
+                                options = ["EMA","SMA","WMA","VWMA"])
+htf_fast_len     = input.int(20,              "MA Veloce – Periodo",                  group = G_HTF, minval = 1)
+htf_slow_type    = input.string("EMA",        "MA Lenta – Tipo",                      group = G_HTF,
+                                options = ["EMA","SMA","WMA","VWMA"])
+htf_slow_len     = input.int(50,              "MA Lenta – Periodo",                   group = G_HTF, minval = 1)
+htf_use_trend    = input.bool(true,           "Usa MA Trend (filtro direzione)",       group = G_HTF)
+htf_trend_type   = input.string("SMA",        "MA Trend – Tipo",                      group = G_HTF,
+                                options = ["EMA","SMA","WMA","VWMA"])
+htf_trend_len    = input.int(200,             "MA Trend – Periodo",                   group = G_HTF, minval = 1)
+htf_price_filter = input.bool(false,          "Filtra per prezzo vs MA Trend",         group = G_HTF,
+                               tooltip = "Long solo se close > MA Trend HTF\nShort solo se close < MA Trend HTF")
+
+// ── LTF (timeframe corrente, default 1 min) ───────────────────────────────
+ltf_fast_type    = input.string("EMA",        "MA Veloce – Tipo",                     group = G_LTF,
+                                options = ["EMA","SMA","WMA","VWMA"])
+ltf_fast_len     = input.int(9,               "MA Veloce – Periodo",                  group = G_LTF, minval = 1)
+ltf_slow_type    = input.string("EMA",        "MA Lenta – Tipo",                      group = G_LTF,
+                                options = ["EMA","SMA","WMA","VWMA"])
+ltf_slow_len     = input.int(21,              "MA Lenta – Periodo",                   group = G_LTF, minval = 1)
+ltf_exit_cross   = input.bool(true,           "Esci su crossover inverso LTF",         group = G_LTF)
+
+// ── Risk Management ───────────────────────────────────────────────────────
+atr_len          = input.int(14,              "ATR – Periodo",                        group = G_RM, minval = 1)
+sl_mult          = input.float(1.5,           "Stop Loss (× ATR)",                    group = G_RM, minval = 0.1, step = 0.1)
+use_trailing     = input.bool(false,          "Trailing Stop",                        group = G_RM)
+trail_mult       = input.float(1.0,           "Trailing Stop – Offset (× ATR)",       group = G_RM, minval = 0.1, step = 0.1)
+rr_ratio         = input.float(2.0,           "Take Profit R:R",                      group = G_RM, minval = 0.1, step = 0.1,
+                               tooltip = "Ignorato se Trailing Stop è attivo")
+
+// ── Sessione ──────────────────────────────────────────────────────────────
+use_session      = input.bool(false,          "Filtra per Sessione",                  group = G_SS)
+session_str      = input.session("0930-1600", "Orario Sessione",                      group = G_SS)
+session_days     = input.string("12345",      "Giorni Operativi (1=Lun … 7=Dom)",     group = G_SS)
+
+// ── Visualizzazione ───────────────────────────────────────────────────────
+show_htf_ma      = input.bool(true,           "Mostra MA HTF (30 min)",               group = G_VIS)
+show_ltf_ma      = input.bool(true,           "Mostra MA LTF (chart)",                group = G_VIS)
+show_fills       = input.bool(true,           "Fill tra le MA",                       group = G_VIS)
+show_htf_bg      = input.bool(true,           "Sfondo colore trend HTF",              group = G_VIS)
+show_signals     = input.bool(true,           "Mostra frecce segnali entrata",        group = G_VIS)
+show_bar_color   = input.bool(false,          "Colora barre per posizione aperta",    group = G_VIS)
+show_sl_tp       = input.bool(true,           "Mostra linee SL / TP",                 group = G_VIS)
+show_table       = input.bool(true,           "Mostra Dashboard",                     group = G_VIS)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  F U N Z I O N I
+// ════════════════════════════════════════════════════════════════════════════
+
+f_ma(src, len, matype) =>
+    switch matype
+        "EMA"  => ta.ema(src, len)
+        "SMA"  => ta.sma(src, len)
+        "WMA"  => ta.wma(src, len)
+        "VWMA" => ta.vwma(src, len)
+        =>        ta.ema(src, len)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  D A T I  H T F  (30 min via request.security)
+// ════════════════════════════════════════════════════════════════════════════
+
+[htf_close, htf_fast, htf_slow, htf_trend] =
+    request.security(syminfo.tickerid, htf_tf,
+                     [close,
+                      f_ma(close, htf_fast_len,  htf_fast_type),
+                      f_ma(close, htf_slow_len,  htf_slow_type),
+                      f_ma(close, htf_trend_len, htf_trend_type)],
+                     lookahead = barmerge.lookahead_off)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  D A T I  L T F  (timeframe corrente del chart)
+// ════════════════════════════════════════════════════════════════════════════
+
+ltf_fast = f_ma(close, ltf_fast_len, ltf_fast_type)
+ltf_slow = f_ma(close, ltf_slow_len, ltf_slow_type)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S E S S I O N E
+// ════════════════════════════════════════════════════════════════════════════
+
+sess_full  = session_str + ":" + session_days
+in_session = use_session ? not na(time(timeframe.period, sess_full)) : true
+
+// ════════════════════════════════════════════════════════════════════════════
+//  T R E N D  H T F
+// ════════════════════════════════════════════════════════════════════════════
+
+htf_bullish = htf_fast > htf_slow and
+              (not htf_use_trend or not htf_price_filter or htf_close > htf_trend)
+
+htf_bearish = htf_fast < htf_slow and
+              (not htf_use_trend or not htf_price_filter or htf_close < htf_trend)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S E G N A L I  E N T R A T A  (crossover LTF con filtro HTF)
+// ════════════════════════════════════════════════════════════════════════════
+
+cross_up   = ta.crossover(ltf_fast,  ltf_slow)
+cross_down = ta.crossunder(ltf_fast, ltf_slow)
+
+long_signal  = cross_up   and htf_bullish and in_session
+short_signal = cross_down and htf_bearish and in_session
+
+// ════════════════════════════════════════════════════════════════════════════
+//  A T R
+// ════════════════════════════════════════════════════════════════════════════
+
+atr_val = ta.atr(atr_len)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  G E S T I O N E  O R D I N I
+// ════════════════════════════════════════════════════════════════════════════
+
+var float entry_sl = na
+var float entry_tp = na
+
+atr_sl        = atr_val * sl_mult
+atr_tp        = atr_val * sl_mult * rr_ratio
+trail_tks     = math.round(atr_val * trail_mult / syminfo.mintick)
+
+// ── Long ─────────────────────────────────────────────────────────────────
+if long_signal and strategy.position_size == 0
+    entry_sl := close - atr_sl
+    entry_tp := close + atr_tp
+    strategy.entry("Long", strategy.long)
+    strategy.exit("XL", "Long",
+         stop         = entry_sl,
+         limit        = use_trailing ? na : entry_tp,
+         trail_offset = use_trailing ? trail_tks : na)
+
+// ── Short ────────────────────────────────────────────────────────────────
+if short_signal and strategy.position_size == 0
+    entry_sl := close + atr_sl
+    entry_tp := close - atr_tp
+    strategy.entry("Short", strategy.short)
+    strategy.exit("XS", "Short",
+         stop         = entry_sl,
+         limit        = use_trailing ? na : entry_tp,
+         trail_offset = use_trailing ? trail_tks : na)
+
+// ── Uscita su crossover inverso ───────────────────────────────────────────
+if ltf_exit_cross
+    if strategy.position_size > 0 and cross_down
+        strategy.close("Long",  comment = "Cross ↓")
+    if strategy.position_size < 0 and cross_up
+        strategy.close("Short", comment = "Cross ↑")
+
+// ════════════════════════════════════════════════════════════════════════════
+//  V I S U A L I Z Z A Z I O N E
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Sfondo trend HTF ─────────────────────────────────────────────────────
+bgcolor(show_htf_bg and htf_bullish ? color.new(color.green, 93) :
+        show_htf_bg and htf_bearish ? color.new(color.red,   93) : na,
+        title = "Sfondo Trend HTF")
+
+// ── MA HTF (30 min) ───────────────────────────────────────────────────────
+p_htf_f = plot(show_htf_ma ? htf_fast : na,
+               title     = "HTF " + htf_fast_type + " " + str.tostring(htf_fast_len),
+               color     = color.new(color.blue, 10),
+               linewidth = 2)
+
+p_htf_s = plot(show_htf_ma ? htf_slow : na,
+               title     = "HTF " + htf_slow_type + " " + str.tostring(htf_slow_len),
+               color     = color.new(color.orange, 10),
+               linewidth = 2)
+
+plot(show_htf_ma and htf_use_trend ? htf_trend : na,
+     title     = "HTF Trend " + htf_trend_type + " " + str.tostring(htf_trend_len),
+     color     = color.new(color.gray, 15),
+     linewidth = 2,
+     style     = plot.style_circles)
+
+fill(p_htf_f, p_htf_s,
+     show_fills ? (htf_bullish ? color.new(color.blue,   88)
+                               : color.new(color.orange, 88)) : na)
+
+// ── MA LTF (chart corrente) ────────────────────────────────────────────────
+p_ltf_f = plot(show_ltf_ma ? ltf_fast : na,
+               title     = "LTF " + ltf_fast_type + " " + str.tostring(ltf_fast_len),
+               color     = color.new(color.lime, 10),
+               linewidth = 1)
+
+p_ltf_s = plot(show_ltf_ma ? ltf_slow : na,
+               title     = "LTF " + ltf_slow_type + " " + str.tostring(ltf_slow_len),
+               color     = color.new(color.red, 10),
+               linewidth = 1)
+
+fill(p_ltf_f, p_ltf_s,
+     show_fills ? (ltf_fast > ltf_slow ? color.new(color.lime, 88)
+                                       : color.new(color.red,  88)) : na)
+
+// ── Segnali entrata ───────────────────────────────────────────────────────
+plotshape(show_signals and long_signal,
+          title     = "Long Signal",
+          location  = location.belowbar,
+          style     = shape.triangleup,
+          size      = size.normal,
+          color     = color.new(color.lime, 0),
+          text      = "L",
+          textcolor = color.black)
+
+plotshape(show_signals and short_signal,
+          title     = "Short Signal",
+          location  = location.abovebar,
+          style     = shape.triangledown,
+          size      = size.normal,
+          color     = color.new(color.red, 0),
+          text      = "S",
+          textcolor = color.white)
+
+// ── Colore barre posizione aperta ─────────────────────────────────────────
+barcolor(show_bar_color and strategy.position_size > 0 ? color.new(color.lime, 40) :
+         show_bar_color and strategy.position_size < 0 ? color.new(color.red,  40) : na)
+
+// ── Stop Loss / Take Profit ───────────────────────────────────────────────
+plot(show_sl_tp and strategy.position_size != 0 ? entry_sl : na,
+     title     = "Stop Loss",
+     color     = color.new(color.red, 10),
+     linewidth = 1,
+     style     = plot.style_linebr)
+
+plot(show_sl_tp and strategy.position_size != 0 and not use_trailing ? entry_tp : na,
+     title     = "Take Profit",
+     color     = color.new(color.green, 10),
+     linewidth = 1,
+     style     = plot.style_linebr)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  D A S H B O A R D
+// ════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 10,
+     bgcolor      = color.new(color.black, 75),
+     border_color = color.new(color.gray,  50),
+     border_width = 1,
+     frame_color  = color.new(color.gray,  20),
+     frame_width  = 1)
+
+if show_table and barstate.islast
+    hdr_bg = color.new(color.navy, 35)
+
+    // ── Intestazione ──────────────────────────────────────────────────────
+    table.cell(dash, 0, 0, "◈ MA MTF 30 / 1",
+               text_color = color.white,  text_size = size.normal, bgcolor = hdr_bg)
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period + "m",
+               text_color = color.silver, text_size = size.small,  bgcolor = hdr_bg)
+
+    // ── Trend HTF ─────────────────────────────────────────────────────────
+    t_tr = htf_bullish ? "▲  BULLISH" : htf_bearish ? "▼  BEARISH" : "—  NEUTRO"
+    c_tr = htf_bullish ? color.lime    : htf_bearish ? color.red    : color.gray
+    table.cell(dash, 0, 1, "Trend " + htf_tf + " min",
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 1, t_tr,
+               text_color = c_tr, text_size = size.small)
+
+    // ── MA HTF Veloce ─────────────────────────────────────────────────────
+    table.cell(dash, 0, 2, "HTF " + htf_fast_type + " " + str.tostring(htf_fast_len),
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(htf_fast, "#.##"),
+               text_color = color.blue, text_size = size.small)
+
+    // ── MA HTF Lenta ──────────────────────────────────────────────────────
+    table.cell(dash, 0, 3, "HTF " + htf_slow_type + " " + str.tostring(htf_slow_len),
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(htf_slow, "#.##"),
+               text_color = color.orange, text_size = size.small)
+
+    // ── MA HTF Trend ──────────────────────────────────────────────────────
+    t_trd = htf_use_trend ? str.tostring(htf_trend, "#.##") : "—"
+    table.cell(dash, 0, 4, "HTF Trend " + htf_trend_type + " " + str.tostring(htf_trend_len),
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 4, t_trd,
+               text_color = color.gray, text_size = size.small)
+
+    // ── MA LTF Veloce ─────────────────────────────────────────────────────
+    c_ltf = ltf_fast > ltf_slow ? color.lime : color.red
+    s_ltf = ltf_fast > ltf_slow ? " ▲" : " ▼"
+    table.cell(dash, 0, 5, "LTF " + ltf_fast_type + " " + str.tostring(ltf_fast_len),
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 5, str.tostring(ltf_fast, "#.##") + s_ltf,
+               text_color = c_ltf, text_size = size.small)
+
+    // ── MA LTF Lenta ──────────────────────────────────────────────────────
+    table.cell(dash, 0, 6, "LTF " + ltf_slow_type + " " + str.tostring(ltf_slow_len),
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 6, str.tostring(ltf_slow, "#.##"),
+               text_color = color.red, text_size = size.small)
+
+    // ── Posizione aperta ──────────────────────────────────────────────────
+    t_pos = strategy.position_size > 0 ? "▲  LONG"  :
+            strategy.position_size < 0 ? "▼  SHORT" : "—  FLAT"
+    c_pos = strategy.position_size > 0 ? color.lime :
+            strategy.position_size < 0 ? color.red  : color.gray
+    table.cell(dash, 0, 7, "Posizione",
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 7, t_pos,
+               text_color = c_pos, text_size = size.small)
+
+    // ── SL / TP attivi ────────────────────────────────────────────────────
+    t_sl = strategy.position_size != 0 ? str.tostring(entry_sl, "#.##") : "—"
+    t_tp = strategy.position_size != 0 and not use_trailing ? str.tostring(entry_tp, "#.##") : use_trailing ? "Trailing" : "—"
+    table.cell(dash, 0, 8, "SL  /  TP",
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 8, t_sl + "  /  " + t_tp,
+               text_color = color.yellow, text_size = size.small)
+
+    // ── ATR ───────────────────────────────────────────────────────────────
+    table.cell(dash, 0, 9, "ATR (" + str.tostring(atr_len) + ")",
+               text_color = color.silver, text_size = size.small)
+    table.cell(dash, 1, 9, str.tostring(atr_val, "#.####"),
+               text_color = color.yellow, text_size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  A L E R T S
+// ════════════════════════════════════════════════════════════════════════════
+
+alertcondition(long_signal,
+     title   = "MA MTF – Long Signal",
+     message = "MA MTF: LONG su {{ticker}} [{{interval}}] – Prezzo: {{close}}")
+
+alertcondition(short_signal,
+     title   = "MA MTF – Short Signal",
+     message = "MA MTF: SHORT su {{ticker}} [{{interval}}] – Prezzo: {{close}}")
+
+alertcondition(ltf_exit_cross and strategy.position_size > 0 and cross_down,
+     title   = "MA MTF – Uscita Long",
+     message = "MA MTF: USCITA LONG su {{ticker}} [{{interval}}] – Prezzo: {{close}}")
+
+alertcondition(ltf_exit_cross and strategy.position_size < 0 and cross_up,
+     title   = "MA MTF – Uscita Short",
+     message = "MA MTF: USCITA SHORT su {{ticker}} [{{interval}}] – Prezzo: {{close}}")
