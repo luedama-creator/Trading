@@ -139,10 +139,9 @@ f_nearest_below(arr, price) =>
 //  lookahead_on + [1] = dati del giorno già chiuso, nessun look-ahead bias
 // ════════════════════════════════════════════════════════════════════════════
 
-[pdh, pdl, pdc] =
-    request.security(syminfo.tickerid, sr_tf,
-                     [high[1], low[1], close[1]],
-                     lookahead = barmerge.lookahead_on)
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, sr_tf,
+                      [high[1], low[1], close[1]],
+                      lookahead = barmerge.lookahead_on)
 
 pp = (pdh + pdl + pdc) / 3
 r1 = 2 * pp - pdl
@@ -156,8 +155,7 @@ s3 = pp - 2 * (pdh - pdl)
 //  D A T I  H T F  (30 min)
 // ════════════════════════════════════════════════════════════════════════════
 
-[htf_e5, htf_e13, htf_s50, htf_s200] =
-    request.security(syminfo.tickerid, htf_tf,
+[htf_e5, htf_e13, htf_s50, htf_s200] = request.security(syminfo.tickerid, htf_tf,
                      [ta.ema(close, htf_e5_len),
                       ta.ema(close, htf_e13_len),
                       ta.sma(close, htf_s50_len),
