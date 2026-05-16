@@ -408,17 +408,13 @@ if show_table and barstate.islast
     table.cell(dash, 1, 13, t_ns, text_color = c_s, text_size = sm)
 
     // Posizione aperta
-    t_pos = strategy.position_size > 0 ? "▲  LONG"  :
-            strategy.position_size < 0 ? "▼  SHORT" : "—  FLAT"
-    c_pos = strategy.position_size > 0 ? color.lime :
-            strategy.position_size < 0 ? color.red  : color.gray
+    t_pos  = strategy.position_size > 0 ? "▲  LONG" : strategy.position_size < 0 ? "▼  SHORT" : "—  FLAT"
+    c_pos  = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
     table.cell(dash, 0, 14, "Posizione", text_color = h, text_size = sm)
     table.cell(dash, 1, 14, t_pos, text_color = c_pos, text_size = sm)
 
-    t_sltp = strategy.position_size != 0
-             ? "SL " + str.tostring(entry_sl,"#.##") + "  |  TP " +
-               (use_trailing ? "Trailing" : str.tostring(entry_tp,"#.##"))
-             : "—"
+    _tp_str = use_trailing ? "Trailing" : str.tostring(entry_tp, "#.##")
+    t_sltp  = strategy.position_size != 0 ? "SL " + str.tostring(entry_sl, "#.##") + "  |  TP " + _tp_str : "—"
     table.cell(dash, 0, 15, "SL / TP", text_color = h, text_size = sm)
     table.cell(dash, 1, 15, t_sltp, text_color = color.yellow, text_size = sm)
 
