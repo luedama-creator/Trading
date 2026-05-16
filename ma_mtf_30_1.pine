@@ -1,0 +1,446 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  MA MTF ES – EMA 5/13 · SMA 50/200 | S/R Giornalieri
+//  Pine Script v6  |  Ottimizzato per E-mini S&P 500 (ES / MES)
+//  Chart: 1 minuto  |  Trend: 30 minuti
+//
+//  LOGICA OPERATIVA
+//  ───────────────────────────────────────────────────────────────────────────
+//  ① Livelli S/R Giornalieri – Pivot Classic (dati giorno precedente):
+//     PP, R1/R2/R3, S1/S2/S3, PDH / PDL / PDC
+//     Definiscono il contesto operativo e i target di uscita.
+//
+//  ② Filtro Trend HTF (30 min) – allineamento coerente di tutte le MA:
+//     ● Bullish : EMA5 > EMA13 > SMA50 > SMA200
+//     ● Bearish : EMA5 < EMA13 < SMA50 < SMA200
+//     (Modalità soft: solo EMA5 vs EMA13 e SMA50 vs SMA200)
+//
+//  ③ Segnali Entrata LTF (1 min):
+//     Trigger: crossover EMA5 / EMA13 con allineamento completo HTF & LTF
+//     ● Long  : EMA5 ▲ EMA13 + align. Bullish su entrambi i TF
+//               + distanza sufficiente dalla resistenza più vicina
+//     ● Short : EMA5 ▼ EMA13 + align. Bearish su entrambi i TF
+//               + distanza sufficiente dal supporto più vicino
+//
+//  ④ Uscita:
+//     ● Cross inverso EMA5/EMA13 su LTF          (primario)
+//     ● Stop Loss basato su ATR                   (protezione)
+//     ● Take Profit al livello S/R successivo     (target, con fallback R:R)
+// ════════════════════════════════════════════════════════════════════════════
+//@version=6
+strategy("MA MTF ES – EMA5/13 SMA50/200 + S/R",
+         shorttitle              = "MA MTF ES",
+         overlay                 = true,
+         initial_capital         = 50000,
+         default_qty_type        = strategy.fixed,
+         default_qty_value       = 1,
+         commission_type         = strategy.commission.cash_per_contract,
+         commission_value        = 2.05,
+         slippage                = 1,
+         pyramiding              = 0,
+         process_orders_on_close = false,
+         calc_on_order_fills     = false,
+         max_lines_count         = 500,
+         max_labels_count        = 500)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  I N P U T S
+// ════════════════════════════════════════════════════════════════════════════
+
+var string G_SR  = "📐 Livelli S/R Giornalieri"
+var string G_HTF = "📊 Timeframe 30 min – Filtro Trend (HTF)"
+var string G_LTF = "⚡ Timeframe 1 min – Segnali Entrata (LTF)"
+var string G_RM  = "🎯 Risk Management"
+var string G_SS  = "🕐 Sessione"
+var string G_VIS = "🎨 Visualizzazione"
+
+// ── S/R Giornalieri ───────────────────────────────────────────────────────
+sr_tf          = input.timeframe("D",      "Timeframe S/R",                     group = G_SR)
+use_sr_filter  = input.bool(true,          "Filtra entrata per prossimità S/R",  group = G_SR,
+                            tooltip = "Blocca Long se troppo vicino a una resistenza\nBlocca Short se troppo vicino a un supporto")
+sr_prox_mult   = input.float(1.0,          "Distanza minima da S/R (× ATR)",     group = G_SR, minval = 0.1, step = 0.1)
+use_sr_tp      = input.bool(true,          "TP al livello S/R successivo",        group = G_SR,
+                            tooltip = "Se disattivo usa il R:R fisso come Take Profit")
+show_pp        = input.bool(true,          "Mostra Pivot Point (PP)",             group = G_SR)
+show_r_levels  = input.bool(true,          "Mostra R1 / R2 / R3",                group = G_SR)
+show_s_levels  = input.bool(true,          "Mostra S1 / S2 / S3",                group = G_SR)
+show_pd_levels = input.bool(true,          "Mostra PDH / PDL / PDC",             group = G_SR)
+
+// ── HTF (30 min) ──────────────────────────────────────────────────────────
+htf_tf         = input.timeframe("30",     "Timeframe Trend (HTF)",              group = G_HTF)
+htf_e5_len     = input.int(5,              "EMA Veloce – Periodo",               group = G_HTF, minval = 1)
+htf_e13_len    = input.int(13,             "EMA Media – Periodo",                group = G_HTF, minval = 1)
+htf_s50_len    = input.int(50,             "SMA Lenta – Periodo",                group = G_HTF, minval = 1)
+htf_s200_len   = input.int(200,            "SMA Trend – Periodo",                group = G_HTF, minval = 1)
+htf_strict     = input.bool(true,          "Allineamento Strict HTF",            group = G_HTF,
+                            tooltip = "ON : EMA5>EMA13>SMA50>SMA200\nOFF: EMA5>EMA13 e SMA50>SMA200 (soft)")
+
+// ── LTF (chart corrente, default 1 min) ───────────────────────────────────
+ltf_e5_len     = input.int(5,              "EMA Veloce – Periodo",               group = G_LTF, minval = 1)
+ltf_e13_len    = input.int(13,             "EMA Media – Periodo",                group = G_LTF, minval = 1)
+ltf_s50_len    = input.int(50,             "SMA Lenta – Periodo",                group = G_LTF, minval = 1)
+ltf_s200_len   = input.int(200,            "SMA Trend – Periodo",                group = G_LTF, minval = 1)
+ltf_strict     = input.bool(false,         "Allineamento Strict LTF",            group = G_LTF,
+                            tooltip = "ON : EMA5>EMA13>SMA50>SMA200\nOFF: EMA5>EMA13 e SMA50>SMA200 (soft – default)")
+ltf_exit_cross = input.bool(true,          "Esci su crossover EMA5/EMA13 inverso", group = G_LTF)
+
+// ── Risk Management ───────────────────────────────────────────────────────
+atr_len        = input.int(14,             "ATR – Periodo",                      group = G_RM, minval = 1)
+sl_mult        = input.float(1.5,          "Stop Loss (× ATR)",                  group = G_RM, minval = 0.1, step = 0.1)
+rr_ratio       = input.float(2.0,          "Take Profit R:R (fallback)",         group = G_RM, minval = 0.1, step = 0.1,
+                            tooltip = "Usato se 'TP al S/R' è disattivo o non ci sono livelli validi")
+use_trailing   = input.bool(false,         "Trailing Stop",                      group = G_RM)
+trail_mult     = input.float(1.0,          "Trailing Offset (× ATR)",            group = G_RM, minval = 0.1, step = 0.1)
+
+// ── Sessione ──────────────────────────────────────────────────────────────
+use_session    = input.bool(true,          "Filtra per Sessione RTH",            group = G_SS)
+sess_time      = input.session("0930-1600","Orario Sessione",                    group = G_SS)
+sess_days      = input.string("12345",     "Giorni (1=Lun … 7=Dom)",             group = G_SS)
+
+// ── Visualizzazione ───────────────────────────────────────────────────────
+show_htf_ma    = input.bool(true,          "Mostra MA HTF (30m)",                group = G_VIS)
+show_ltf_ma    = input.bool(true,          "Mostra MA LTF (chart)",              group = G_VIS)
+show_fills     = input.bool(true,          "Fill tra EMA5 / EMA13",              group = G_VIS)
+show_htf_bg    = input.bool(true,          "Sfondo allineamento HTF",            group = G_VIS)
+show_signals   = input.bool(true,          "Frecce segnali entrata",             group = G_VIS)
+show_bar_color = input.bool(false,         "Colora barre per posizione",         group = G_VIS)
+show_sl_tp     = input.bool(true,          "Linee SL / TP",                      group = G_VIS)
+show_table     = input.bool(true,          "Dashboard",                          group = G_VIS)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  F U N Z I O N I
+// ════════════════════════════════════════════════════════════════════════════
+
+f_align_bull(e5, e13, s50, s200, strict) =>
+    strict ? e5 > e13 and e13 > s50 and s50 > s200
+           : e5 > e13 and s50 > s200
+
+f_align_bear(e5, e13, s50, s200, strict) =>
+    strict ? e5 < e13 and e13 < s50 and s50 < s200
+           : e5 < e13 and s50 < s200
+
+f_nearest_above(arr, price) =>
+    res = float(na)
+    for i = 0 to array.size(arr) - 1
+        lvl = array.get(arr, i)
+        if not na(lvl) and lvl > price
+            res := na(res) ? lvl : math.min(res, lvl)
+    res
+
+f_nearest_below(arr, price) =>
+    res = float(na)
+    for i = 0 to array.size(arr) - 1
+        lvl = array.get(arr, i)
+        if not na(lvl) and lvl < price
+            res := na(res) ? lvl : math.max(res, lvl)
+    res
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S / R  G I O R N A L I E R I  (Pivot Classic – giorno precedente)
+//  lookahead_on + [1] = dati del giorno già chiuso, nessun look-ahead bias
+// ════════════════════════════════════════════════════════════════════════════
+
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, sr_tf,
+                      [high[1], low[1], close[1]],
+                      lookahead = barmerge.lookahead_on)
+
+pp = (pdh + pdl + pdc) / 3
+r1 = 2 * pp - pdl
+r2 = pp + (pdh - pdl)
+r3 = pp + 2 * (pdh - pdl)
+s1 = 2 * pp - pdh
+s2 = pp - (pdh - pdl)
+s3 = pp - 2 * (pdh - pdl)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  D A T I  H T F  (30 min)
+// ════════════════════════════════════════════════════════════════════════════
+
+[htf_e5, htf_e13, htf_s50, htf_s200] = request.security(syminfo.tickerid, htf_tf,
+                     [ta.ema(close, htf_e5_len),
+                      ta.ema(close, htf_e13_len),
+                      ta.sma(close, htf_s50_len),
+                      ta.sma(close, htf_s200_len)],
+                     lookahead = barmerge.lookahead_off)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  D A T I  L T F  (timeframe corrente del chart)
+// ════════════════════════════════════════════════════════════════════════════
+
+ltf_e5   = ta.ema(close, ltf_e5_len)
+ltf_e13  = ta.ema(close, ltf_e13_len)
+ltf_s50  = ta.sma(close, ltf_s50_len)
+ltf_s200 = ta.sma(close, ltf_s200_len)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S E S S I O N E
+// ════════════════════════════════════════════════════════════════════════════
+
+in_session = use_session
+             ? not na(time(timeframe.period, sess_time + ":" + sess_days))
+             : true
+
+// ════════════════════════════════════════════════════════════════════════════
+//  A L L I N E A M E N T O  M A
+// ════════════════════════════════════════════════════════════════════════════
+
+htf_bull = f_align_bull(htf_e5, htf_e13, htf_s50, htf_s200, htf_strict)
+htf_bear = f_align_bear(htf_e5, htf_e13, htf_s50, htf_s200, htf_strict)
+ltf_bull = f_align_bull(ltf_e5, ltf_e13, ltf_s50, ltf_s200, ltf_strict)
+ltf_bear = f_align_bear(ltf_e5, ltf_e13, ltf_s50, ltf_s200, ltf_strict)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  A T R  &  P R O S S I M I T À  S / R
+// ════════════════════════════════════════════════════════════════════════════
+
+atr_val    = ta.atr(atr_len)
+all_sr_arr = array.from(pp, r1, r2, r3, s1, s2, s3, pdh, pdl, pdc)
+
+nearest_res = f_nearest_above(all_sr_arr, close)
+nearest_sup = f_nearest_below(all_sr_arr, close)
+
+room_long  = not use_sr_filter or na(nearest_res) or
+             (nearest_res - close) >= atr_val * sr_prox_mult
+
+room_short = not use_sr_filter or na(nearest_sup) or
+             (close - nearest_sup) >= atr_val * sr_prox_mult
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S E G N A L I  E N T R A T A
+// ════════════════════════════════════════════════════════════════════════════
+
+cross_up   = ta.crossover(ltf_e5,  ltf_e13)
+cross_down = ta.crossunder(ltf_e5, ltf_e13)
+
+long_signal  = cross_up   and htf_bull and ltf_bull and room_long  and in_session
+short_signal = cross_down and htf_bear and ltf_bear and room_short and in_session
+
+// ════════════════════════════════════════════════════════════════════════════
+//  G E S T I O N E  O R D I N I
+// ════════════════════════════════════════════════════════════════════════════
+
+var float entry_sl = na
+var float entry_tp = na
+
+atr_sl    = atr_val * sl_mult
+trail_tks = math.round(atr_val * trail_mult / syminfo.mintick)
+
+// ── Long ──────────────────────────────────────────────────────────────────
+if long_signal and strategy.position_size == 0
+    entry_sl  := close - atr_sl
+    _sr_above  = f_nearest_above(all_sr_arr, close)
+    _valid_sr  = not na(_sr_above) and _sr_above > close + atr_sl
+    entry_tp  := use_sr_tp and _valid_sr ? _sr_above : close + atr_sl * rr_ratio
+    strategy.entry("Long", strategy.long)
+    strategy.exit("XL", "Long",
+         stop         = entry_sl,
+         limit        = use_trailing ? na : entry_tp,
+         trail_offset = use_trailing ? trail_tks : na)
+
+// ── Short ─────────────────────────────────────────────────────────────────
+if short_signal and strategy.position_size == 0
+    entry_sl  := close + atr_sl
+    _sr_below  = f_nearest_below(all_sr_arr, close)
+    _valid_sr  = not na(_sr_below) and _sr_below < close - atr_sl
+    entry_tp  := use_sr_tp and _valid_sr ? _sr_below : close - atr_sl * rr_ratio
+    strategy.entry("Short", strategy.short)
+    strategy.exit("XS", "Short",
+         stop         = entry_sl,
+         limit        = use_trailing ? na : entry_tp,
+         trail_offset = use_trailing ? trail_tks : na)
+
+// ── Uscita su cross inverso EMA5/EMA13 ───────────────────────────────────
+if ltf_exit_cross
+    if strategy.position_size > 0 and cross_down
+        strategy.close("Long",  comment = "Cross ↓ EMA5/13")
+    if strategy.position_size < 0 and cross_up
+        strategy.close("Short", comment = "Cross ↑ EMA5/13")
+
+// ════════════════════════════════════════════════════════════════════════════
+//  V I S U A L I Z Z A Z I O N E  –  S / R  G I O R N A L I E R I
+// ════════════════════════════════════════════════════════════════════════════
+
+c_r  = color.new(color.red,    15)
+c_s  = color.new(color.lime,   15)
+c_pp = color.new(color.white,  25)
+c_pd = color.new(color.yellow, 20)
+
+plot(show_pp        ? pp  : na, "PP",  c_pp, linewidth = 1, style = plot.style_line)
+plot(show_r_levels  ? r1  : na, "R1",  c_r,  linewidth = 1, style = plot.style_line)
+plot(show_r_levels  ? r2  : na, "R2",  c_r,  linewidth = 1, style = plot.style_line)
+plot(show_r_levels  ? r3  : na, "R3",  c_r,  linewidth = 1, style = plot.style_line)
+plot(show_s_levels  ? s1  : na, "S1",  c_s,  linewidth = 1, style = plot.style_line)
+plot(show_s_levels  ? s2  : na, "S2",  c_s,  linewidth = 1, style = plot.style_line)
+plot(show_s_levels  ? s3  : na, "S3",  c_s,  linewidth = 1, style = plot.style_line)
+plot(show_pd_levels ? pdh : na, "PDH", c_pd, linewidth = 1, style = plot.style_line)
+plot(show_pd_levels ? pdl : na, "PDL", c_pd, linewidth = 1, style = plot.style_line)
+plot(show_pd_levels ? pdc : na, "PDC", color.new(color.yellow, 45), linewidth = 1, style = plot.style_circles)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  V I S U A L I Z Z A Z I O N E  –  M E D I E  M O B I L I
+// ════════════════════════════════════════════════════════════════════════════
+
+// Sfondo allineamento HTF
+bgcolor(show_htf_bg and htf_bull ? color.new(color.green, 93) :
+        show_htf_bg and htf_bear ? color.new(color.red,   93) : na,
+        title = "Sfondo Align. HTF")
+
+// ── MA HTF (30 min) ── Famiglia "Oceano" – SPESSE (3 px) ─────────────────
+// Colori freddi/blu: distinguibili immediatamente dal LTF
+plot(show_htf_ma ? htf_s200 : na, "HTF SMA200 [30m]",
+     color.new(#808080, 0), linewidth = 2, style = plot.style_circles)
+plot(show_htf_ma ? htf_s50  : na, "HTF SMA50  [30m]",
+     color.new(#FF8C00, 0), linewidth = 3)
+p_htf_e13 = plot(show_htf_ma ? htf_e13 : na, "HTF EMA13  [30m]",
+                 color.new(#1E90FF, 0), linewidth = 3)
+p_htf_e5  = plot(show_htf_ma ? htf_e5  : na, "HTF EMA5   [30m]",
+                 color.new(#00E5FF, 0), linewidth = 3)
+
+fill(p_htf_e5, p_htf_e13,
+     show_fills ? (htf_bull ? color.new(#00E5FF, 86) :
+                  htf_bear ? color.new(#FF4444, 86) :
+                             color.new(color.gray, 92)) : na)
+
+// ── MA LTF (1 min / chart corrente) ── Famiglia "Vivace" – SOTTILI (1 px) ─
+// Colori caldi/saturi: immediatamente diversi dall'HTF
+plot(show_ltf_ma ? ltf_s200 : na, "LTF SMA200 [1m]",
+     color.new(#BDBDBD, 40), linewidth = 1, style = plot.style_circles)
+plot(show_ltf_ma ? ltf_s50  : na, "LTF SMA50  [1m]",
+     color.new(#FFD700, 0), linewidth = 1)
+p_ltf_e13 = plot(show_ltf_ma ? ltf_e13 : na, "LTF EMA13  [1m]",
+                 color.new(#FF1493, 0), linewidth = 1)
+p_ltf_e5  = plot(show_ltf_ma ? ltf_e5  : na, "LTF EMA5   [1m]",
+                 color.new(#00FF00, 0), linewidth = 1)
+
+fill(p_ltf_e5, p_ltf_e13,
+     show_fills ? (ltf_bull ? color.new(#00FF00, 88) :
+                  ltf_bear ? color.new(#FF1493, 88) :
+                             color.new(color.gray, 92)) : na)
+
+// ── Segnali BUY / SELL ────────────────────────────────────────────────────
+plotshape(show_signals and long_signal,
+          title     = "BUY Signal",
+          location  = location.belowbar,
+          style     = shape.triangleup,
+          size      = size.large,
+          color     = color.new(#00FF00, 0),
+          text      = "BUY",
+          textcolor = color.black)
+
+plotshape(show_signals and short_signal,
+          title     = "SELL Signal",
+          location  = location.abovebar,
+          style     = shape.triangledown,
+          size      = size.large,
+          color     = color.new(#FF0000, 0),
+          text      = "SELL",
+          textcolor = color.white)
+
+// Barcolor posizione
+barcolor(show_bar_color and strategy.position_size > 0 ? color.new(color.lime, 55) :
+         show_bar_color and strategy.position_size < 0 ? color.new(color.red,  55) : na)
+
+// Linee SL / TP
+plot(show_sl_tp and strategy.position_size != 0 ? entry_sl : na,
+     "SL", color.new(color.red,   10), linewidth = 1, style = plot.style_linebr)
+plot(show_sl_tp and strategy.position_size != 0 and not use_trailing ? entry_tp : na,
+     "TP", color.new(color.green, 10), linewidth = 1, style = plot.style_linebr)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  D A S H B O A R D
+// ════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 16,
+     bgcolor      = color.new(color.black, 72),
+     border_color = color.new(color.gray,  50),
+     border_width = 1,
+     frame_color  = color.new(color.gray,  20),
+     frame_width  = 1)
+
+if show_table and barstate.islast
+    hdr = color.new(color.navy, 35)
+    h   = color.silver
+    sm  = size.small
+
+    table.cell(dash, 0, 0, "◈ MA MTF ES",
+               text_color = color.white, text_size = size.normal, bgcolor = hdr)
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period + "m",
+               text_color = color.silver, text_size = sm, bgcolor = hdr)
+
+    // Allineamento HTF / LTF
+    t_ht = htf_bull ? "▲ BULLISH" : htf_bear ? "▼ BEARISH" : "— NEUTRO"
+    c_ht = htf_bull ? color.lime  : htf_bear ? color.red   : color.gray
+    table.cell(dash, 0, 1, "Align. HTF " + htf_tf + "m", text_color = h,    text_size = sm)
+    table.cell(dash, 1, 1, t_ht,                          text_color = c_ht, text_size = sm)
+
+    t_lt = ltf_bull ? "▲ BULLISH" : ltf_bear ? "▼ BEARISH" : "— NEUTRO"
+    c_lt = ltf_bull ? color.lime  : ltf_bear ? color.red   : color.gray
+    table.cell(dash, 0, 2, "Align. LTF " + timeframe.period + "m", text_color = h,    text_size = sm)
+    table.cell(dash, 1, 2, t_lt,                                     text_color = c_lt, text_size = sm)
+
+    // Separatore MA
+    table.cell(dash, 0, 3, "── MA HTF ──", text_color = color.new(color.aqua, 20), text_size = sm)
+    table.cell(dash, 1, 3, "── 30 min  ──", text_color = color.new(color.aqua, 20), text_size = sm)
+
+    // MA HTF
+    table.cell(dash, 0, 4, "EMA " + str.tostring(htf_e5_len),   text_color = h, text_size = sm)
+    table.cell(dash, 1, 4, str.tostring(htf_e5,  "#.##"),        text_color = color.aqua,   text_size = sm)
+    table.cell(dash, 0, 5, "EMA " + str.tostring(htf_e13_len),  text_color = h, text_size = sm)
+    table.cell(dash, 1, 5, str.tostring(htf_e13, "#.##"),        text_color = color.blue,   text_size = sm)
+    table.cell(dash, 0, 6, "SMA " + str.tostring(htf_s50_len),  text_color = h, text_size = sm)
+    table.cell(dash, 1, 6, str.tostring(htf_s50, "#.##"),        text_color = color.orange, text_size = sm)
+    table.cell(dash, 0, 7, "SMA " + str.tostring(htf_s200_len), text_color = h, text_size = sm)
+    table.cell(dash, 1, 7, str.tostring(htf_s200,"#.##"),        text_color = color.gray,   text_size = sm)
+
+    // Separatore S/R
+    table.cell(dash, 0, 8, "── S/R Giornalieri ──", text_color = color.yellow, text_size = sm)
+    table.cell(dash, 1, 8, "PDH  " + str.tostring(pdh, "#.##") + "  PDL  " + str.tostring(pdl, "#.##"),
+               text_color = c_pd, text_size = sm)
+
+    table.cell(dash, 0, 9,  "PP",          text_color = h, text_size = sm)
+    table.cell(dash, 1, 9,  str.tostring(pp, "#.##"), text_color = color.white, text_size = sm)
+
+    table.cell(dash, 0, 10, "R1 / R2 / R3", text_color = h, text_size = sm)
+    table.cell(dash, 1, 10,
+               str.tostring(r1,"#.##") + " / " + str.tostring(r2,"#.##") + " / " + str.tostring(r3,"#.##"),
+               text_color = c_r, text_size = sm)
+
+    table.cell(dash, 0, 11, "S1 / S2 / S3", text_color = h, text_size = sm)
+    table.cell(dash, 1, 11,
+               str.tostring(s1,"#.##") + " / " + str.tostring(s2,"#.##") + " / " + str.tostring(s3,"#.##"),
+               text_color = c_s, text_size = sm)
+
+    // Prossimità S/R
+    t_nr = not na(nearest_res) ? str.tostring(nearest_res, "#.##") : "—"
+    t_ns = not na(nearest_sup) ? str.tostring(nearest_sup, "#.##") : "—"
+    table.cell(dash, 0, 12, "Res. più vicina ↑", text_color = h, text_size = sm)
+    table.cell(dash, 1, 12, t_nr, text_color = c_r, text_size = sm)
+    table.cell(dash, 0, 13, "Sup. più vicino ↓", text_color = h, text_size = sm)
+    table.cell(dash, 1, 13, t_ns, text_color = c_s, text_size = sm)
+
+    // Posizione aperta
+    t_pos  = strategy.position_size > 0 ? "▲  LONG" : strategy.position_size < 0 ? "▼  SHORT" : "—  FLAT"
+    c_pos  = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 0, 14, "Posizione", text_color = h, text_size = sm)
+    table.cell(dash, 1, 14, t_pos, text_color = c_pos, text_size = sm)
+
+    _tp_str = use_trailing ? "Trailing" : str.tostring(entry_tp, "#.##")
+    t_sltp  = strategy.position_size != 0 ? "SL " + str.tostring(entry_sl, "#.##") + "  |  TP " + _tp_str : "—"
+    table.cell(dash, 0, 15, "SL / TP", text_color = h, text_size = sm)
+    table.cell(dash, 1, 15, t_sltp, text_color = color.yellow, text_size = sm)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  A L E R T S
+//  Nelle strategy si usa alert() con if, non alertcondition()
+// ════════════════════════════════════════════════════════════════════════════
+
+if long_signal
+    alert("BUY " + syminfo.ticker + " [" + timeframe.period + "m] – Prezzo: " + str.tostring(close, "#.##") + " | Align. Bullish HTF+LTF", alert.freq_once_per_bar)
+
+if short_signal
+    alert("SELL " + syminfo.ticker + " [" + timeframe.period + "m] – Prezzo: " + str.tostring(close, "#.##") + " | Align. Bearish HTF+LTF", alert.freq_once_per_bar)
+
+if ltf_exit_cross and strategy.position_size > 0 and cross_down
+    alert("USCITA LONG " + syminfo.ticker + " [" + timeframe.period + "m] – Cross ↓ EMA5/EMA13", alert.freq_once_per_bar)
+
+if ltf_exit_cross and strategy.position_size < 0 and cross_up
+    alert("USCITA SHORT " + syminfo.ticker + " [" + timeframe.period + "m] – Cross ↑ EMA5/EMA13", alert.freq_once_per_bar)
