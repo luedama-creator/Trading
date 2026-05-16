@@ -79,8 +79,8 @@ ltf_e5_len     = input.int(5,              "EMA Veloce – Periodo",            
 ltf_e13_len    = input.int(13,             "EMA Media – Periodo",                group = G_LTF, minval = 1)
 ltf_s50_len    = input.int(50,             "SMA Lenta – Periodo",                group = G_LTF, minval = 1)
 ltf_s200_len   = input.int(200,            "SMA Trend – Periodo",                group = G_LTF, minval = 1)
-ltf_strict     = input.bool(true,          "Allineamento Strict LTF",            group = G_LTF,
-                            tooltip = "ON : EMA5>EMA13>SMA50>SMA200\nOFF: EMA5>EMA13 e SMA50>SMA200 (soft)")
+ltf_strict     = input.bool(false,         "Allineamento Strict LTF",            group = G_LTF,
+                            tooltip = "ON : EMA5>EMA13>SMA50>SMA200\nOFF: EMA5>EMA13 e SMA50>SMA200 (soft – default)")
 ltf_exit_cross = input.bool(true,          "Esci su crossover EMA5/EMA13 inverso", group = G_LTF)
 
 // ── Risk Management ───────────────────────────────────────────────────────
@@ -284,46 +284,56 @@ bgcolor(show_htf_bg and htf_bull ? color.new(color.green, 93) :
         show_htf_bg and htf_bear ? color.new(color.red,   93) : na,
         title = "Sfondo Align. HTF")
 
-// MA HTF (30 min) – linee più spesse per distinguerle dalle LTF
-plot(show_htf_ma ? htf_s200 : na, "HTF SMA200",
-     color.new(color.gray,   20), linewidth = 2, style = plot.style_circles)
-plot(show_htf_ma ? htf_s50  : na, "HTF SMA50",
-     color.new(color.orange, 15), linewidth = 2)
-p_htf_e13 = plot(show_htf_ma ? htf_e13 : na, "HTF EMA13",
-                 color.new(color.blue, 10), linewidth = 2)
-p_htf_e5  = plot(show_htf_ma ? htf_e5  : na, "HTF EMA5",
-                 color.new(color.aqua,  10), linewidth = 1)
+// ── MA HTF (30 min) ── Famiglia "Oceano" – SPESSE (3 px) ─────────────────
+// Colori freddi/blu: distinguibili immediatamente dal LTF
+plot(show_htf_ma ? htf_s200 : na, "HTF SMA200 [30m]",
+     color.new(#808080, 0), linewidth = 2, style = plot.style_circles)
+plot(show_htf_ma ? htf_s50  : na, "HTF SMA50  [30m]",
+     color.new(#FF8C00, 0), linewidth = 3)
+p_htf_e13 = plot(show_htf_ma ? htf_e13 : na, "HTF EMA13  [30m]",
+                 color.new(#1E90FF, 0), linewidth = 3)
+p_htf_e5  = plot(show_htf_ma ? htf_e5  : na, "HTF EMA5   [30m]",
+                 color.new(#00E5FF, 0), linewidth = 3)
 
 fill(p_htf_e5, p_htf_e13,
-     show_fills ? (htf_bull ? color.new(color.aqua, 88) :
-                  htf_bear ? color.new(color.red,  88) :
+     show_fills ? (htf_bull ? color.new(#00E5FF, 86) :
+                  htf_bear ? color.new(#FF4444, 86) :
                              color.new(color.gray, 92)) : na)
 
-// MA LTF (chart corrente) – linee sottili
-plot(show_ltf_ma ? ltf_s200 : na, "LTF SMA200",
-     color.new(color.gray,    10), linewidth = 2, style = plot.style_circles)
-plot(show_ltf_ma ? ltf_s50  : na, "LTF SMA50",
-     color.new(color.orange,  10), linewidth = 1)
-p_ltf_e13 = plot(show_ltf_ma ? ltf_e13 : na, "LTF EMA13",
-                 color.new(color.fuchsia, 10), linewidth = 1)
-p_ltf_e5  = plot(show_ltf_ma ? ltf_e5  : na, "LTF EMA5",
-                 color.new(color.lime,    10), linewidth = 1)
+// ── MA LTF (1 min / chart corrente) ── Famiglia "Vivace" – SOTTILI (1 px) ─
+// Colori caldi/saturi: immediatamente diversi dall'HTF
+plot(show_ltf_ma ? ltf_s200 : na, "LTF SMA200 [1m]",
+     color.new(#BDBDBD, 40), linewidth = 1, style = plot.style_circles)
+plot(show_ltf_ma ? ltf_s50  : na, "LTF SMA50  [1m]",
+     color.new(#FFD700, 0), linewidth = 1)
+p_ltf_e13 = plot(show_ltf_ma ? ltf_e13 : na, "LTF EMA13  [1m]",
+                 color.new(#FF1493, 0), linewidth = 1)
+p_ltf_e5  = plot(show_ltf_ma ? ltf_e5  : na, "LTF EMA5   [1m]",
+                 color.new(#00FF00, 0), linewidth = 1)
 
 fill(p_ltf_e5, p_ltf_e13,
-     show_fills ? (ltf_bull ? color.new(color.lime,    88) :
-                  ltf_bear ? color.new(color.fuchsia, 88) :
-                             color.new(color.gray,    92)) : na)
+     show_fills ? (ltf_bull ? color.new(#00FF00, 88) :
+                  ltf_bear ? color.new(#FF1493, 88) :
+                             color.new(color.gray, 92)) : na)
 
-// Segnali entrata
+// ── Segnali BUY / SELL ────────────────────────────────────────────────────
 plotshape(show_signals and long_signal,
-          title = "Long", location = location.belowbar,
-          style = shape.triangleup, size = size.normal,
-          color = color.new(color.lime, 0), text = "L", textcolor = color.black)
+          title     = "BUY Signal",
+          location  = location.belowbar,
+          style     = shape.triangleup,
+          size      = size.large,
+          color     = color.new(#00FF00, 0),
+          text      = "BUY",
+          textcolor = color.black)
 
 plotshape(show_signals and short_signal,
-          title = "Short", location = location.abovebar,
-          style = shape.triangledown, size = size.normal,
-          color = color.new(color.red, 0), text = "S", textcolor = color.white)
+          title     = "SELL Signal",
+          location  = location.abovebar,
+          style     = shape.triangledown,
+          size      = size.large,
+          color     = color.new(#FF0000, 0),
+          text      = "SELL",
+          textcolor = color.white)
 
 // Barcolor posizione
 barcolor(show_bar_color and strategy.position_size > 0 ? color.new(color.lime, 55) :
@@ -423,12 +433,12 @@ if show_table and barstate.islast
 // ════════════════════════════════════════════════════════════════════════════
 
 alertcondition(long_signal,
-     title   = "MA MTF ES – Long",
-     message = "LONG {{ticker}} [{{interval}}] – Prezzo: {{close}} | Align. Bullish HTF+LTF")
+     title   = "MA MTF ES – BUY Signal",
+     message = "BUY {{ticker}} [{{interval}}] – Prezzo: {{close}} | Align. Bullish HTF+LTF")
 
 alertcondition(short_signal,
-     title   = "MA MTF ES – Short",
-     message = "SHORT {{ticker}} [{{interval}}] – Prezzo: {{close}} | Align. Bearish HTF+LTF")
+     title   = "MA MTF ES – SELL Signal",
+     message = "SELL {{ticker}} [{{interval}}] – Prezzo: {{close}} | Align. Bearish HTF+LTF")
 
 alertcondition(ltf_exit_cross and strategy.position_size > 0 and cross_down,
      title   = "MA MTF ES – Uscita Long",
