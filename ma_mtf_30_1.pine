@@ -430,20 +430,17 @@ if show_table and barstate.islast
 
 // ════════════════════════════════════════════════════════════════════════════
 //  A L E R T S
+//  Nelle strategy si usa alert() con if, non alertcondition()
 // ════════════════════════════════════════════════════════════════════════════
 
-alertcondition(long_signal,
-     title   = "MA MTF ES – BUY Signal",
-     message = "BUY {{ticker}} [{{interval}}] – Prezzo: {{close}} | Align. Bullish HTF+LTF")
+if long_signal
+    alert("BUY " + syminfo.ticker + " [" + timeframe.period + "m] – Prezzo: " + str.tostring(close, "#.##") + " | Align. Bullish HTF+LTF", alert.freq_once_per_bar)
 
-alertcondition(short_signal,
-     title   = "MA MTF ES – SELL Signal",
-     message = "SELL {{ticker}} [{{interval}}] – Prezzo: {{close}} | Align. Bearish HTF+LTF")
+if short_signal
+    alert("SELL " + syminfo.ticker + " [" + timeframe.period + "m] – Prezzo: " + str.tostring(close, "#.##") + " | Align. Bearish HTF+LTF", alert.freq_once_per_bar)
 
-alertcondition(ltf_exit_cross and strategy.position_size > 0 and cross_down,
-     title   = "MA MTF ES – Uscita Long",
-     message = "USCITA LONG {{ticker}} [{{interval}}] – Cross ↓ EMA5/EMA13")
+if ltf_exit_cross and strategy.position_size > 0 and cross_down
+    alert("USCITA LONG " + syminfo.ticker + " [" + timeframe.period + "m] – Cross ↓ EMA5/EMA13", alert.freq_once_per_bar)
 
-alertcondition(ltf_exit_cross and strategy.position_size < 0 and cross_up,
-     title   = "MA MTF ES – Uscita Short",
-     message = "USCITA SHORT {{ticker}} [{{interval}}] – Cross ↑ EMA5/EMA13")
+if ltf_exit_cross and strategy.position_size < 0 and cross_up
+    alert("USCITA SHORT " + syminfo.ticker + " [" + timeframe.period + "m] – Cross ↑ EMA5/EMA13", alert.freq_once_per_bar)
