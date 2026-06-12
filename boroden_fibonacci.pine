@@ -1,0 +1,486 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  Boroden Fibonacci – Cluster, Simmetria & Trigger
+//  Pine Script v6  |  Basato sulla metodologia di Carolyn Boroden
+//  (EW "Comprendere la nostra strategia Fibonacci" + libro "Fibonacci Trading")
+//
+//  COME USARLO
+//  ───────────────────────────────────────────────────────────────────────────
+//  Applica l'indicatore su un grafico a 15 minuti o 1 minuto (i timeframe
+//  "trigger" della metodologia). Il trend principale viene letto in automatico
+//  dal Daily e dal 2h tramite request.security.
+//
+//  COSA FA (mappatura con la metodologia)
+//  ───────────────────────────────────────────────────────────────────────────
+//  1) TREND MULTI-TIMEFRAME (Daily + 2h)
+//     • Posizione del prezzo rispetto a SMA 200 e SMA 50
+//     • Modalità delle EMA veloci (8/34, oppure 5/13)
+//     • Struttura degli swing: massimi/minimi crescenti o decrescenti
+//     → tabella in alto a destra con trend, ROYAL SETUP e bias operativo.
+//       ROYAL SETUP = prezzo sopra(sotto) SMA200 e SMA50 + EMA veloci concordi.
+//
+//  2) ZONE DI CONFLUENZA FIBONACCI (sul grafico corrente, 15m / 1m)
+//     • Ritracciamenti degli swing precedenti: 0.382, 0.50, 0.618, 0.786
+//     • Estensioni degli swing precedenti:     1.272, 1.618
+//     • Proiezioni di simmetria (100%) degli swing correttivi precedenti
+//     → quando ALMENO N relazioni (default 3 = "Fibonacci Price Cluster")
+//       coincidono in un intervallo ristretto, viene disegnata una zona:
+//       verde = cluster di supporto (BUY), rossa = cluster di resistenza (SELL).
+//
+//  3) TRIGGER DI INGRESSO  (Setup + Trigger = Ingresso; nessun trigger = no trade)
+//     BUY  : EMA 8 incrocia sopra EMA 34  E  viene superato un precedente
+//            massimo di oscillazione            → triangolo VERDE sotto la barra
+//     SELL : EMA 8 incrocia sotto EMA 34  E  viene violato un precedente
+//            minimo di oscillazione             → triangolo ROSSO sopra la barra
+//     Filtri opzionali: allineamento col trend Daily/2h e test recente
+//     di una zona cluster.
+//
+//  4) STOP LOSS & TAKE PROFIT
+//     SL  : sotto il minimo (sopra il massimo) realizzato prima del trigger,
+//           oppure oltre l'estremo della zona cluster (opzione 2 del piano).
+//     TP  : estensioni 1.272 / 1.618 / 2.618 dello swing correttivo
+//           entrato nella zona di setup (target 1, 2 e 3 della metodologia).
+// ════════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("Boroden Fibonacci – Cluster, Simmetria & Trigger",
+     shorttitle      = "Fib Boroden",
+     overlay         = true,
+     max_lines_count = 500,
+     max_labels_count = 500,
+     max_boxes_count = 250)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  INPUT
+// ════════════════════════════════════════════════════════════════════════════
+g1 = "1) Trend multi-timeframe"
+tfA        = input.timeframe("D",   "Timeframe trend principale",  group = g1)
+tfB        = input.timeframe("120", "Timeframe trend secondario",  group = g1)
+useEma513  = input.bool(false, "Usa EMA 5/13 invece di 8/34 (più aggressivo)", group = g1)
+showTable  = input.bool(true,  "Mostra tabella trend / Royal Setup",           group = g1)
+
+g2 = "2) Swing & zone di confluenza Fibonacci"
+pivLen         = input.int(5,    "Sensibilità swing (barre pivot)", minval = 2, maxval = 20, group = g2)
+maxPiv         = input.int(10,   "Swing memorizzati per l'analisi", minval = 6, maxval = 14, group = g2)
+useR382        = input.bool(true,  "Ritracciamento 0.382",  group = g2, inline = "r1")
+useR50         = input.bool(true,  "0.50",                  group = g2, inline = "r1")
+useR618        = input.bool(true,  "0.618",                 group = g2, inline = "r2")
+useR786        = input.bool(true,  "0.786",                 group = g2, inline = "r2")
+useExt         = input.bool(true,  "Estensioni 1.272 / 1.618",                 group = g2)
+useSym         = input.bool(true,  "Proiezioni di simmetria 100%",             group = g2)
+minRel         = input.int(3,    "Relazioni minime per un cluster", minval = 2, maxval = 6, group = g2)
+clusterTolMult = input.float(0.5, "Ampiezza massima cluster (x ATR14)", minval = 0.1, step = 0.1, group = g2)
+maxDistMult    = input.float(10.0, "Distanza massima zone dal prezzo (x ATR14)", minval = 2, step = 0.5, group = g2)
+showZones      = input.bool(true, "Disegna le zone cluster", group = g2)
+
+g3 = "3) Trigger di ingresso (EMA 8/34 + rottura swing)"
+emaFastLen  = input.int(8,  "EMA veloce", minval = 1, group = g3, inline = "e")
+emaSlowLen  = input.int(34, "EMA lenta",  minval = 2, group = g3, inline = "e")
+showEmas    = input.bool(true, "Mostra le EMA sul grafico", group = g3)
+needBreak   = input.bool(true, "Richiedi rottura dello swing precedente (regola completa)", group = g3)
+armBars     = input.int(30, "Validità del cross EMA (barre)", minval = 5, group = g3)
+trendFilter = input.string("Entrambi (principale + secondario)", "Filtro trend",
+     options = ["Entrambi (principale + secondario)", "Solo trend principale", "Solo trend secondario", "Nessuno"], group = g3)
+needZone     = input.bool(true, "Richiedi test recente di una zona cluster (Setup + Trigger)", group = g3)
+zoneLookback = input.int(20, "Barre massime dal test della zona", minval = 1, group = g3)
+
+g4 = "4) Stop loss & Take profit"
+slMode    = input.string("Minimo/Massimo pre-trigger", "Posizione dello stop",
+     options = ["Minimo/Massimo pre-trigger", "Estremo della zona cluster"], group = g4)
+slAtrBuf  = input.float(0.25, "Buffer dello stop (x ATR14)", minval = 0.0, step = 0.05, group = g4)
+showTrade = input.bool(true, "Disegna linee SL / TP", group = g4)
+tradeBars = input.int(40, "Lunghezza linee SL / TP (barre)", minval = 10, maxval = 300, group = g4)
+
+// Colori
+colBuy   = color.new(#089981, 0)
+colSell  = color.new(#f23645, 0)
+colSupBg = color.new(#089981, 82)
+colResBg = color.new(#f23645, 82)
+
+atrVal     = ta.atr(14)
+clusterTol = atrVal * clusterTolMult
+
+// ════════════════════════════════════════════════════════════════════════════
+//  1) TREND MULTI-TIMEFRAME  (Daily e 2h)
+// ════════════════════════════════════════════════════════════════════════════
+htfFastLen = useEma513 ? 5 : 8
+htfSlowLen = useEma513 ? 13 : 34
+
+// Punteggio di trend: prezzo vs SMA200, vs SMA50, EMA veloci e struttura swing
+f_trend() =>
+    s200 = ta.sma(close, 200)
+    s50  = ta.sma(close, 50)
+    eF   = ta.ema(close, htfFastLen)
+    eS   = ta.ema(close, htfSlowLen)
+    hPiv = ta.pivothigh(high, 3, 3)
+    lPiv = ta.pivotlow(low, 3, 3)
+    var float ph0 = na
+    var float ph1 = na
+    var float pl0 = na
+    var float pl1 = na
+    if not na(hPiv)
+        ph1 := ph0
+        ph0 := hPiv
+    if not na(lPiv)
+        pl1 := pl0
+        pl0 := lPiv
+    structUp = not na(ph1) and not na(pl1) and ph0 > ph1 and pl0 > pl1
+    structDn = not na(ph1) and not na(pl1) and ph0 < ph1 and pl0 < pl1
+    score = 0
+    score += close > s200 ? 1 : -1
+    score += close > s50  ? 1 : -1
+    score += eF > eS      ? 1 : -1
+    score += structUp ? 1 : structDn ? -1 : 0
+    royalBuy  = close > s200 and close > s50 and eF > eS
+    royalSell = close < s200 and close < s50 and eF < eS
+    [score, royalBuy, royalSell]
+
+[scoreA, royalBuyA, royalSellA] = request.security(syminfo.tickerid, tfA, f_trend(), lookahead = barmerge.lookahead_off)
+[scoreB, royalBuyB, royalSellB] = request.security(syminfo.tickerid, tfB, f_trend(), lookahead = barmerge.lookahead_off)
+
+trendUpA = nz(scoreA) >= 2
+trendDnA = nz(scoreA) <= -2
+trendUpB = nz(scoreB) >= 2
+trendDnB = nz(scoreB) <= -2
+
+trendOkLong = trendFilter == "Nessuno" ? true :
+     trendFilter == "Solo trend principale" ? trendUpA :
+     trendFilter == "Solo trend secondario" ? trendUpB :
+     trendUpA and trendUpB
+trendOkShort = trendFilter == "Nessuno" ? true :
+     trendFilter == "Solo trend principale" ? trendDnA :
+     trendFilter == "Solo trend secondario" ? trendDnB :
+     trendDnA and trendDnB
+
+// ════════════════════════════════════════════════════════════════════════════
+//  2) SWING (zig-zag) E LIVELLI FIBONACCI SUL GRAFICO CORRENTE
+// ════════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+// Zig-zag: pivot alternati massimo/minimo (gli ultimi maxPiv punti)
+var array<float> zzPrice  = array.new_float()
+var array<int>   zzBar    = array.new_int()
+var array<bool>  zzIsHigh = array.new_bool()
+
+f_addPivot(float price, int b, bool isHigh) =>
+    n = array.size(zzPrice)
+    if n == 0
+        array.push(zzPrice, price)
+        array.push(zzBar, b)
+        array.push(zzIsHigh, isHigh)
+    else
+        lastIsHigh = array.get(zzIsHigh, n - 1)
+        if lastIsHigh == isHigh
+            // Due pivot consecutivi dello stesso tipo: tieni il più estremo
+            lastPrice = array.get(zzPrice, n - 1)
+            if (isHigh and price > lastPrice) or (not isHigh and price < lastPrice)
+                array.set(zzPrice, n - 1, price)
+                array.set(zzBar, n - 1, b)
+        else
+            array.push(zzPrice, price)
+            array.push(zzBar, b)
+            array.push(zzIsHigh, isHigh)
+    while array.size(zzPrice) > maxPiv
+        array.shift(zzPrice)
+        array.shift(zzBar)
+        array.shift(zzIsHigh)
+
+// Ultimi pivot confermati (per la rottura dello swing nel trigger)
+var float lastPH = na
+var float lastPL = na
+
+newPivot = false
+if not na(ph)
+    f_addPivot(ph, bar_index - pivLen, true)
+    lastPH  := ph
+    newPivot := true
+if not na(pl)
+    f_addPivot(pl, bar_index - pivLen, false)
+    lastPL  := pl
+    newPivot := true
+
+// Aggiunge un livello candidato se sta dal lato giusto del prezzo e non troppo lontano
+f_add(array<float> arr, float lvl, bool isSup) =>
+    if not na(lvl)
+        ok = isSup ?
+             lvl < close and close - lvl <= atrVal * maxDistMult :
+             lvl > close and lvl - close <= atrVal * maxDistMult
+        if ok
+            array.push(arr, lvl)
+
+// Costruisce tutti i livelli Fibonacci dagli swing del zig-zag:
+//  - ritracciamenti e estensioni su ogni coppia minimo→massimo (supporti)
+//    e massimo→minimo (resistenze)
+//  - proiezioni di simmetria 100% degli swing correttivi
+f_buildLevels() =>
+    supLv = array.new_float()
+    resLv = array.new_float()
+    n = array.size(zzPrice)
+    if n >= 3
+        pN1 = array.get(zzPrice, n - 1)
+        hN1 = array.get(zzIsHigh, n - 1)
+        pN2 = array.get(zzPrice, n - 2)
+        lastHi    = hN1 ? pN1 : pN2
+        lastHiIdx = hN1 ? n - 1 : n - 2
+        lastLo    = hN1 ? pN2 : pN1
+        lastLoIdx = hN1 ? n - 2 : n - 1
+        // Ritracciamenti ed estensioni su tutte le coppie di swing
+        for i = 0 to n - 2
+            pi  = array.get(zzPrice, i)
+            iHi = array.get(zzIsHigh, i)
+            for j = i + 1 to n - 1
+                pj  = array.get(zzPrice, j)
+                jHi = array.get(zzIsHigh, j)
+                if not iHi and jHi and pj > pi
+                    // Swing minimo→massimo: ritracciamenti/estensioni = supporti
+                    rng = pj - pi
+                    if useR382
+                        f_add(supLv, pj - rng * 0.382, true)
+                    if useR50
+                        f_add(supLv, pj - rng * 0.500, true)
+                    if useR618
+                        f_add(supLv, pj - rng * 0.618, true)
+                    if useR786
+                        f_add(supLv, pj - rng * 0.786, true)
+                    if useExt
+                        f_add(supLv, pj - rng * 1.272, true)
+                        f_add(supLv, pj - rng * 1.618, true)
+                if iHi and not jHi and pi > pj
+                    // Swing massimo→minimo: ritracciamenti/estensioni = resistenze
+                    rng = pi - pj
+                    if useR382
+                        f_add(resLv, pj + rng * 0.382, false)
+                    if useR50
+                        f_add(resLv, pj + rng * 0.500, false)
+                    if useR618
+                        f_add(resLv, pj + rng * 0.618, false)
+                    if useR786
+                        f_add(resLv, pj + rng * 0.786, false)
+                    if useExt
+                        f_add(resLv, pj + rng * 1.272, false)
+                        f_add(resLv, pj + rng * 1.618, false)
+        // Simmetria: proietta il 100% degli swing correttivi precedenti
+        // dall'ultimo massimo (per i supporti) o dall'ultimo minimo (resistenze)
+        if useSym
+            for i = 0 to n - 2
+                p1  = array.get(zzPrice, i)
+                h1  = array.get(zzIsHigh, i)
+                p2  = array.get(zzPrice, i + 1)
+                if h1 and p1 > p2 and i != lastHiIdx
+                    f_add(supLv, lastHi - (p1 - p2), true)
+                if not h1 and p2 > p1 and i != lastLoIdx
+                    f_add(resLv, lastLo + (p2 - p1), false)
+    [supLv, resLv]
+
+// Raggruppa i livelli ordinati: un cluster = almeno minRel livelli
+// entro clusterTol (definizione di Fibonacci Price Cluster)
+f_cluster(array<float> levels) =>
+    bots = array.new_float()
+    tops = array.new_float()
+    cnts = array.new_int()
+    nL = array.size(levels)
+    if nL >= minRel
+        array.sort(levels, order.ascending)
+        i = 0
+        while i < nL
+            j = i
+            while j + 1 < nL and array.get(levels, j + 1) - array.get(levels, i) <= clusterTol
+                j += 1
+            if j - i + 1 >= minRel
+                array.push(bots, array.get(levels, i))
+                array.push(tops, array.get(levels, j))
+                array.push(cnts, j - i + 1)
+            i := j + 1
+    [bots, tops, cnts]
+
+// Zone cluster attive
+var array<float> supBot = array.new_float()
+var array<float> supTop = array.new_float()
+var array<float> resBot = array.new_float()
+var array<float> resTop = array.new_float()
+var array<box>   zoneBoxes = array.new<box>()
+
+f_redrawZones(array<float> sBot, array<float> sTop, array<int> sCnt, array<float> rBot, array<float> rTop, array<int> rCnt) =>
+    while array.size(zoneBoxes) > 0
+        box.delete(array.shift(zoneBoxes))
+    pad = atrVal * 0.05
+    if array.size(sBot) > 0
+        for k = 0 to array.size(sBot) - 1
+            array.push(zoneBoxes, box.new(bar_index - pivLen, array.get(sTop, k) + pad, bar_index, array.get(sBot, k) - pad,
+                 border_color = colBuy, border_width = 1, extend = extend.right, bgcolor = colSupBg,
+                 text = "Cluster BUY ×" + str.tostring(array.get(sCnt, k)), text_color = colBuy, text_size = size.tiny, text_halign = text.align_right))
+    if array.size(rBot) > 0
+        for k = 0 to array.size(rBot) - 1
+            array.push(zoneBoxes, box.new(bar_index - pivLen, array.get(rTop, k) + pad, bar_index, array.get(rBot, k) - pad,
+                 border_color = colSell, border_width = 1, extend = extend.right, bgcolor = colResBg,
+                 text = "Cluster SELL ×" + str.tostring(array.get(rCnt, k)), text_color = colSell, text_size = size.tiny, text_halign = text.align_right))
+
+// Ricalcola le zone ogni volta che si conferma un nuovo swing
+if newPivot
+    [supLv, resLv] = f_buildLevels()
+    [sb, st, sc] = f_cluster(supLv)
+    [rb, rt, rc] = f_cluster(resLv)
+    supBot := sb
+    supTop := st
+    resBot := rb
+    resTop := rt
+    if showZones
+        f_redrawZones(sb, st, sc, rb, rt, rc)
+
+// Test delle zone: il prezzo ha toccato un cluster di recente?
+var int   lastSupTestBar = na
+var float lastSupZoneBot = na
+var int   lastResTestBar = na
+var float lastResZoneTop = na
+
+if array.size(supBot) > 0
+    for k = 0 to array.size(supBot) - 1
+        if low <= array.get(supTop, k) and high >= array.get(supBot, k)
+            lastSupTestBar := bar_index
+            lastSupZoneBot := array.get(supBot, k)
+if array.size(resBot) > 0
+    for k = 0 to array.size(resBot) - 1
+        if high >= array.get(resBot, k) and low <= array.get(resTop, k)
+            lastResTestBar := bar_index
+            lastResZoneTop := array.get(resTop, k)
+
+zoneOkLong  = not needZone or (not na(lastSupTestBar) and bar_index - lastSupTestBar <= zoneLookback)
+zoneOkShort = not needZone or (not na(lastResTestBar) and bar_index - lastResTestBar <= zoneLookback)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  3) TRIGGER DI INGRESSO: cross EMA 8/34 + rottura dello swing precedente
+// ════════════════════════════════════════════════════════════════════════════
+emaF = ta.ema(close, emaFastLen)
+emaS = ta.ema(close, emaSlowLen)
+plot(showEmas ? emaF : na, "EMA veloce", color = color.new(color.orange, 0), linewidth = 1)
+plot(showEmas ? emaS : na, "EMA lenta",  color = color.new(color.blue, 30), linewidth = 1)
+
+crossUp = ta.crossover(emaF, emaS)
+crossDn = ta.crossunder(emaF, emaS)
+lowRecent  = ta.lowest(low, pivLen * 2)
+highRecent = ta.highest(high, pivLen * 2)
+
+var bool  buyArmed     = false
+var float buyBreakLvl  = na
+var float preTrigLow   = na
+var int   buyArmBar    = na
+var bool  sellArmed    = false
+var float sellBreakLvl = na
+var float preTrigHigh  = na
+var int   sellArmBar   = na
+
+if crossUp
+    buyArmed    := true
+    buyBreakLvl := lastPH
+    preTrigLow  := lowRecent
+    buyArmBar   := bar_index
+    sellArmed   := false
+if crossDn
+    sellArmed    := true
+    sellBreakLvl := lastPL
+    preTrigHigh  := highRecent
+    sellArmBar   := bar_index
+    buyArmed     := false
+
+if buyArmed
+    preTrigLow := math.min(preTrigLow, low)
+    if bar_index - buyArmBar > armBars
+        buyArmed := false
+if sellArmed
+    preTrigHigh := math.max(preTrigHigh, high)
+    if bar_index - sellArmBar > armBars
+        sellArmed := false
+
+// Rottura dello swing: chiusura oltre l'ultimo massimo/minimo di oscillazione.
+// Se non c'è ancora un pivot disponibile, vale il solo cross delle EMA.
+buyBreakOk  = not needBreak or na(buyBreakLvl) or close > buyBreakLvl
+sellBreakOk = not needBreak or na(sellBreakLvl) or close < sellBreakLvl
+
+buyTrigger  = buyArmed and buyBreakOk and (not needBreak ? crossUp : true) and trendOkLong and zoneOkLong and barstate.isconfirmed
+sellTrigger = sellArmed and sellBreakOk and (not needBreak ? crossDn : true) and trendOkShort and zoneOkShort and barstate.isconfirmed
+
+// Triangoli di ingresso: verdi per BUY, rossi per SELL
+plotshape(buyTrigger,  "Trigger BUY",  shape.triangleup,   location.belowbar, colBuy,  size = size.small)
+plotshape(sellTrigger, "Trigger SELL", shape.triangledown, location.abovebar, colSell, size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  4) STOP LOSS E TAKE PROFIT (1.272 / 1.618 / 2.618 dello swing nella zona)
+// ════════════════════════════════════════════════════════════════════════════
+var array<line>  tradeLines  = array.new<line>()
+var array<label> tradeLabels = array.new<label>()
+
+f_capDrawings() =>
+    while array.size(tradeLines) > 120
+        line.delete(array.shift(tradeLines))
+    while array.size(tradeLabels) > 120
+        label.delete(array.shift(tradeLabels))
+
+f_lvlLine(float y, color c, string style, string txt) =>
+    array.push(tradeLines, line.new(bar_index, y, bar_index + tradeBars, y, color = c, width = 1, style = style))
+    array.push(tradeLabels, label.new(bar_index + tradeBars, y, txt + " " + str.tostring(y, format.mintick),
+         style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = size.small))
+
+f_drawTrade(bool isBuy, float entryP, float slP, float t1, float t2, float t3) =>
+    cDir = isBuy ? colBuy : colSell
+    f_lvlLine(entryP, color.new(color.gray, 20), line.style_dotted, isBuy ? "BUY" : "SELL")
+    f_lvlLine(slP, color.new(color.red, 0), line.style_solid, "SL")
+    f_lvlLine(t1, cDir, line.style_solid,  "TP1 1.272")
+    f_lvlLine(t2, cDir, line.style_dashed, "TP2 1.618")
+    f_lvlLine(t3, cDir, line.style_dotted, "TP3 2.618")
+    f_capDrawings()
+
+if buyTrigger and showTrade
+    // Swing correttivo entrato nella zona: dall'ultimo massimo al minimo pre-trigger
+    swingHi = na(lastPH) ? highRecent : math.max(lastPH, highRecent)
+    swingLo = preTrigLow
+    rngT = swingHi - swingLo
+    if rngT <= 0
+        rngT := atrVal * 4
+    slBase = slMode == "Estremo della zona cluster" and not na(lastSupZoneBot) ? lastSupZoneBot : preTrigLow
+    f_drawTrade(true, close, slBase - atrVal * slAtrBuf,
+         swingLo + rngT * 1.272, swingLo + rngT * 1.618, swingLo + rngT * 2.618)
+
+if sellTrigger and showTrade
+    swingLo2 = na(lastPL) ? lowRecent : math.min(lastPL, lowRecent)
+    swingHi2 = preTrigHigh
+    rngT2 = swingHi2 - swingLo2
+    if rngT2 <= 0
+        rngT2 := atrVal * 4
+    slBase2 = slMode == "Estremo della zona cluster" and not na(lastResZoneTop) ? lastResZoneTop : preTrigHigh
+    f_drawTrade(false, close, slBase2 + atrVal * slAtrBuf,
+         swingHi2 - rngT2 * 1.272, swingHi2 - rngT2 * 1.618, swingHi2 - rngT2 * 2.618)
+
+// Disinnesca il trigger dopo l'ingresso
+if buyTrigger
+    buyArmed := false
+if sellTrigger
+    sellArmed := false
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TABELLA TREND / ROYAL SETUP
+// ════════════════════════════════════════════════════════════════════════════
+f_trendTxt(int sc) =>
+    na(sc) ? "n/d" : sc >= 2 ? "RIALZISTA ▲" : sc <= -2 ? "RIBASSISTA ▼" : "NEUTRO ◆"
+
+f_trendCol(int sc) =>
+    na(sc) ? color.gray : sc >= 2 ? colBuy : sc <= -2 ? colSell : color.gray
+
+var table tt = table.new(position.top_right, 2, 5, bgcolor = color.new(color.black, 25), border_width = 1, border_color = color.new(color.gray, 60))
+if showTable and barstate.islast
+    table.cell(tt, 0, 0, "Boroden Fib", text_color = color.white, text_size = size.small)
+    table.cell(tt, 1, 0, "Stato",       text_color = color.white, text_size = size.small)
+    table.cell(tt, 0, 1, "Trend " + tfA, text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 1, f_trendTxt(scoreA), text_color = f_trendCol(scoreA), text_size = size.small)
+    table.cell(tt, 0, 2, "Trend " + tfB, text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 2, f_trendTxt(scoreB), text_color = f_trendCol(scoreB), text_size = size.small)
+    royalTxt = royalBuyA ? "ROYAL BUY ✔" : royalSellA ? "ROYAL SELL ✔" : "—"
+    table.cell(tt, 0, 3, "Royal Setup (" + tfA + ")", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 3, royalTxt, text_color = royalBuyA ? colBuy : royalSellA ? colSell : color.gray, text_size = size.small)
+    biasTxt = trendOkLong ? "Cercare BUY" : trendOkShort ? "Cercare SELL" : "Attendere"
+    table.cell(tt, 0, 4, "Bias operativo", text_color = color.silver, text_size = size.small)
+    table.cell(tt, 1, 4, biasTxt, text_color = trendOkLong ? colBuy : trendOkShort ? colSell : color.gray, text_size = size.small)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ALERT
+// ════════════════════════════════════════════════════════════════════════════
+alertcondition(buyTrigger,  "Boroden – Trigger BUY",  "Trigger BUY: EMA 8>34 + rottura swing high (setup Fibonacci)")
+alertcondition(sellTrigger, "Boroden – Trigger SELL", "Trigger SELL: EMA 8<34 + rottura swing low (setup Fibonacci)")
