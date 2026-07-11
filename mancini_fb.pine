@@ -1,0 +1,781 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  Mancini FB – Failed Breakdown su ES/MES
+//  Indicatore Pine Script v6 basato sulla sintesi operativa della metodologia
+//  di Adam Mancini (Failed Breakdown, minimi significativi, accettazione).
+//
+//  TIMEFRAME CONSIGLIATI
+//  ───────────────────────────────────────────────────────────────────────────
+//  Grafico: 3–5 min (timeframe di conferma / macchina a stati).
+//  Rilevamento minimi significativi: 15 min (via request.security, input).
+//  Il grafico deve avere TF ≤ TF di rilevamento.
+//
+//  MODULI (sez. 7 del documento)
+//  ───────────────────────────────────────────────────────────────────────────
+//  1. Tabella S/R manuale: livelli giornalieri via text-area, una riga per
+//     livello nel formato:  S,6010,Etichetta,2   oppure   R,6120,PDH
+//     (lato S/R, prezzo, etichetta opzionale, rango 1–4 opzionale = spessore).
+//     Zone con buffer configurabile (default 12 pt, range Mancini 10–18) e
+//     flip automatico S↔R al superamento confermato.
+//  2. Minimi Significativi automatici: pivot low su 15 min (struttura 1-1 o
+//     2-2), reazione ≥ 20 pt misurata low→high successivo, marcatura PDL
+//     (gold standard), validazione in sessione precedente (criterio CRITICO).
+//  3. Motore Failed Breakdown: penetrazione sotto un minimo qualificato,
+//     classificazione shallow (<20) / deep (>20), cautela/skip oltre 25 pt,
+//     invalidazione a 2-3 chiusure sotto il livello, candela C di recupero e
+//     BOS di conferma (rottura del massimo della candela C).
+//  4. Macchina a stati accettazione: NEUTRO → BREAKDOWN → RECUPERO →
+//     ACCETTAZIONE TIPO 1 (backtest dall'alto) / TIPO 2 (doppio recupero) /
+//     NON-ACCETTAZIONE (prezzo > minimo + 5 pt per ≥ N minuti) → ENTRY →
+//     INVALIDATO. Zona di pericolo (0–5 pt sopra il minimo) evidenziata.
+//  5. Filtri di contesto: killzone 8:00-11:00 EST, volume relativo sul
+//     breakdown (proxy absorption), filtro Modalità 1 / Modalità 2.
+//  6. Alert: tocco zona S/R, breakdown, flush profondo, recupero, BOS,
+//     accettazione per tipo, trigger entry, invalidazione, flip di livello.
+//
+//  GESTIONE (sez. 6): al trigger vengono proiettati Entry, Stop (default
+//  3 pt sotto il low del breakdown), Target 1 (livello successivo / +20 pt)
+//  e Target 2 (PDH / +40 pt).
+// ════════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("Mancini FB – Failed Breakdown (ES/MES)",
+     shorttitle      = "Mancini FB",
+     overlay         = true,
+     max_lines_count = 500,
+     max_labels_count= 500,
+     max_boxes_count = 250)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  I N P U T S
+// ════════════════════════════════════════════════════════════════════════════
+var string G1 = "1️⃣ Tabella S/R manuale (livelli giornalieri)"
+var string G2 = "2️⃣ Minimi Significativi (rilevamento automatico)"
+var string G3 = "3️⃣ Motore Failed Breakdown"
+var string G4 = "4️⃣ Accettazione"
+var string G5 = "5️⃣ Ingresso, stop e target"
+var string G6 = "6️⃣ Filtri di contesto"
+var string G7 = "🎨 Grafica"
+
+// ── 1. Tabella S/R manuale ───────────────────────────────────────────────────
+i_lvlTxt     = input.text_area("", "Livelli manuali (uno per riga)", group=G1,
+     tooltip="Formato: LATO,PREZZO,ETICHETTA,RANGO\nLATO = S (supporto) o R (resistenza)\nETICHETTA e RANGO (1-4, spessore linea) opzionali.\nEsempi:\nS,6010,Supporto chiave,3\nR,6120,PDH\nS,5985")
+i_buffer     = input.float (12.0, "Buffer zona (punti)", minval=0.0, step=0.5, group=G1,
+     tooltip="I livelli sono zone, non punti: Mancini usa 10-18 punti di tolleranza.")
+i_useFlip    = input.bool  (true, "Flip automatico S↔R al superamento confermato", group=G1,
+     tooltip="Resistenza superata → diventa supporto; supporto ceduto → diventa resistenza.")
+i_flipCloses = input.int   (2,    "Chiusure oltre il buffer per confermare il flip", minval=1, maxval=5, group=G1)
+i_lrManual   = input.bool  (true, "Usa i supporti manuali nel motore FB (Level Reclaim)", group=G1,
+     tooltip="Variante Level Reclaim (sez. 4.4): stessa logica del FB su una linea S/R orizzontale.")
+i_showZones  = input.bool  (true, "Mostra zone (box con buffer)", group=G1)
+i_supCol     = input.color (color.new(#26A69A, 0),  "Colore supporti",   group=G1)
+i_resCol     = input.color (color.new(#EF5350, 0),  "Colore resistenze", group=G1)
+i_lvlStyle   = input.string("Continua", "Stile linea livelli manuali", options=["Continua", "Tratteggiata", "Punteggiata"], group=G1)
+
+// ── 2. Minimi Significativi ──────────────────────────────────────────────────
+i_slTF       = input.timeframe("15", "Timeframe di rilevamento", group=G2,
+     tooltip="Il documento prescrive 15 min. Il grafico deve avere TF ≤ a questo.")
+i_pivL       = input.int   (2,    "Barre sinistra pivot", minval=1, maxval=10, group=G2,
+     tooltip="1-1 = struttura minima; 2-2 = swing forte.")
+i_pivR       = input.int   (2,    "Barre destra pivot",   minval=1, maxval=10, group=G2)
+i_reaction   = input.float (20.0, "Reazione minima (punti, low→high)", minval=1.0, group=G2,
+     tooltip="Misurata dal low assoluto del candidato al massimo delle candele successive.")
+i_requireVal = input.bool  (true, "Richiedi validazione in sessione precedente", group=G2,
+     tooltip="Criterio CRITICO: il livello deve essere stato validato in una sessione precedente, non in tempo reale durante il downtrend corrente.")
+i_usePDL     = input.bool  (true, "Includi il PDL come livello gold-standard", group=G2)
+i_maxSL      = input.int   (6,    "Numero massimo minimi attivi", minval=1, maxval=15, group=G2)
+i_minGapSL   = input.float (5.0,  "Gap minimo tra minimi (punti)", minval=0.0, group=G2)
+
+// ── 3. Motore Failed Breakdown ───────────────────────────────────────────────
+i_bkdClose   = input.bool  (false, "Breakdown richiede CLOSE sotto il livello", group=G3,
+     tooltip="OFF (default) = basta lo spike del wick: lo stop hunt tipico è 3-15 punti sotto il minimo.")
+i_shallowMax = input.float (20.0, "Soglia shallow / deep (punti)", minval=1.0, group=G3,
+     tooltip="Flush < soglia = FB superficiale (shallow); > soglia = profondo (deep).")
+i_maxDepth   = input.float (25.0, "Profondità massima (punti) → skip / invalidazione", minval=1.0, group=G3,
+     tooltip="Oltre 25 punti senza recupero immediato il breakdown è potenzialmente reale: cautela massima / skip.")
+i_invalClose = input.int   (3,    "Chiusure consecutive sotto il livello → invalidazione", minval=2, maxval=10, group=G3,
+     tooltip="Il documento indica 2-3 chiusure (≈ 10-15 minuti ai margini del range).")
+
+// ── 4. Accettazione ──────────────────────────────────────────────────────────
+i_entryMode  = input.string("Accettazione (Tipo 1 / Tipo 2 / NA)", "Modalità ingresso",
+     options=["Accettazione (Tipo 1 / Tipo 2 / NA)", "BOS dopo il recupero (conservativa)", "Chiusura di recupero (aggressiva)"], group=G4,
+     tooltip="Accettazione = protocollo completo Mancini (sez. 5).\nBOS = stop order sulla rottura del massimo della candela C.\nAggressiva = a mercato sulla chiusura della candela C.")
+i_btTol      = input.float (2.0,  "Tolleranza backtest Tipo 1 (punti)", minval=0.25, step=0.25, group=G4,
+     tooltip="Tipo 1: il prezzo ritesta il minimo dall'alto entro questa distanza e vi rimbalza sopra.")
+i_danger     = input.float (5.0,  "Zona di pericolo sopra il minimo (punti)", minval=1.0, group=G4,
+     tooltip="La fascia 0-5 punti sopra il minimo percorsa lentamente è dove avviene l'intrappolamento.")
+i_naMin      = input.int   (3,    "Minuti oltre la zona di pericolo (non-accettazione)", minval=1, maxval=30, group=G4,
+     tooltip="Protocollo di non accettazione: prezzo stabile oltre minimo+5 pt per 2-3 minuti → ingresso.")
+i_fastDepth  = input.float (10.0, "Flush ≤ N punti: fast-track su BOS", minval=0.0, group=G4,
+     tooltip="Sotto ~10 punti di flush il protocollo di accettazione è spesso superfluo: ingresso diretto sul BOS.")
+
+// ── 5. Ingresso, stop e target ───────────────────────────────────────────────
+i_stopOff    = input.float (3.0,  "Stop: punti sotto il low del breakdown", minval=0.25, step=0.25, group=G5,
+     tooltip="Stop 2-3 punti sotto il low assoluto del breakdown, NON sotto il minimo significativo originale.")
+i_t1Pts      = input.float (20.0, "Target 1 di default (punti)", minval=1.0, group=G5,
+     tooltip="Livello successivo / zona pre-discesa: ~+20 punti. Chiudere il 60-75%.")
+i_t2Pts      = input.float (40.0, "Target 2 di default (punti)", minval=1.0, group=G5,
+     tooltip="Swing high di sessione o PDH (+35-50 punti), solo con contesto rialzista.")
+i_lvlTargets = input.bool  (true, "Usa i livelli (R manuali / flip / PDH) come target", group=G5)
+
+// ── 6. Filtri di contesto ────────────────────────────────────────────────────
+i_useKZ      = input.bool   (false,       "Rileva breakdown solo in killzone", group=G6)
+i_kz         = input.session("0800-1100", "Killzone (HH:MM)", group=G6)
+i_tzKZ       = input.string ("America/New_York", "Fuso orario killzone", group=G6)
+i_useVol     = input.bool   (false, "Richiedi volume alto sul breakdown (absorption)", group=G6)
+i_volLen     = input.int    (20,    "Media volume (barre)", minval=2, group=G6)
+i_volMult    = input.float  (1.2,   "Moltiplicatore volume", minval=0.1, step=0.1, group=G6)
+i_useMode    = input.bool   (false, "Blocca nuovi FB in Modalità 1 ribassista", group=G6,
+     tooltip="I FB sono il pattern d'elezione della Modalità 2 (range). Con trend ribassista conclamato il setup è controtendenza.")
+i_modeLen    = input.int    (40,    "Barre per la misura del trend (Modalità)", minval=5, group=G6)
+i_modeMult   = input.float  (3.0,   "Soglia trend (× ATR14)", minval=0.5, step=0.5, group=G6)
+
+// ── 7. Grafica ───────────────────────────────────────────────────────────────
+i_showTable  = input.bool  (true, "Mostra pannello di stato", group=G7)
+i_showLbls   = input.bool  (true, "Mostra etichette", group=G7)
+i_showBG     = input.bool  (true, "Sfondo durante breakdown / recupero", group=G7)
+i_slCol      = input.color (color.new(#2962FF, 0),   "Minimi significativi qualificati", group=G7)
+i_slPendCol  = input.color (color.new(color.gray, 30), "Minimi in attesa di validazione", group=G7)
+i_pdlCol     = input.color (color.new(#F9A825, 0),   "PDL / PDH", group=G7)
+i_dzCol      = input.color (color.new(#EF5350, 80),  "Zona di pericolo (0-5 pt)", group=G7)
+i_entryCol   = input.color (color.new(#00E676, 0),   "Segnale entry", group=G7)
+i_invalCol   = input.color (color.new(color.gray, 0),"Segnale invalidato", group=G7)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  C O N T E S T O   G L O B A L E
+// ════════════════════════════════════════════════════════════════════════════
+string FMT      = format.mintick
+int    COOLDOWN = 5                    // barre di attesa dopo entry/invalidazione
+
+bool  inKZ    = not na(time(timeframe.period, i_kz, i_tzKZ))
+float volSMA  = ta.sma(volume, i_volLen)
+float volRatio= volSMA > 0 ? volume / volSMA : na
+float atr14   = ta.atr(14)
+float drift   = close - close[i_modeLen]
+bool  mode1Up = drift >  atr14 * i_modeMult
+bool  mode1Dn = drift < -atr14 * i_modeMult
+string modeStr= mode1Up ? "Modalità 1 ↑" : mode1Dn ? "Modalità 1 ↓" : "Modalità 2 (range)"
+
+// Barre del grafico corrispondenti alle barre destre del pivot HTF
+int   winBars   = math.max(1, math.round(i_pivR * timeframe.in_seconds(i_slTF) / timeframe.in_seconds(timeframe.period)))
+float recentHi  = ta.highest(high, winBars)
+
+// Contatore di sessione (giorni) per la validazione dei minimi
+var int dayId = 0
+bool newDay   = timeframe.change("D")
+if newDay
+    dayId += 1
+
+// Stile linea dei livelli manuali
+f_style(string s) =>
+    switch s
+        "Tratteggiata" => line.style_dashed
+        "Punteggiata"  => line.style_dotted
+        => line.style_solid
+
+// Trim senza str.trim (regex Java)
+f_trim(string s) =>
+    string m = str.match(s, "\\S(?:[\\s\\S]*\\S)?")
+    na(m) ? "" : m
+
+// ════════════════════════════════════════════════════════════════════════════
+//  M O D U L O  1  –  T A B E L L A   S / R   M A N U A L E
+// ════════════════════════════════════════════════════════════════════════════
+var array<float>  mPrice = array.new<float>()
+var array<string> mName  = array.new<string>()
+var array<int>    mRole  = array.new<int>()      // 1 = supporto, 0 = resistenza
+var array<int>    mCnt   = array.new<int>()      // chiusure consecutive oltre il buffer
+var array<line>   mLine  = array.new<line>()
+var array<box>    mBox   = array.new<box>()
+var array<label>  mLab   = array.new<label>()
+
+f_mLabelTxt(int idx) =>
+    string side = array.get(mRole, idx) == 1 ? "S" : "R"
+    string nm   = array.get(mName, idx)
+    side + " " + str.tostring(array.get(mPrice, idx), FMT) + (nm != "" ? "  " + nm : "")
+
+if barstate.isfirst and f_trim(i_lvlTxt) != ""
+    array<string> rows = str.split(i_lvlTxt, "\n")
+    for row in rows
+        array<string> parts = str.split(row, ",")
+        if array.size(parts) >= 2
+            string side = str.upper(f_trim(array.get(parts, 0)))
+            float  px   = str.tonumber(f_trim(array.get(parts, 1)))
+            string nm   = array.size(parts) >= 3 ? f_trim(array.get(parts, 2)) : ""
+            float  rkF  = array.size(parts) >= 4 ? str.tonumber(f_trim(array.get(parts, 3))) : na
+            int    rk   = na(rkF) ? 1 : math.max(1, math.min(4, math.round(rkF)))
+            if not na(px) and (side == "S" or side == "R")
+                int role   = side == "S" ? 1 : 0
+                color col  = role == 1 ? i_supCol : i_resCol
+                array.push(mPrice, px)
+                array.push(mName,  nm)
+                array.push(mRole,  role)
+                array.push(mCnt,   0)
+                array.push(mLine, line.new(bar_index, px, bar_index + 1, px,
+                     xloc=xloc.bar_index, extend=extend.right, color=col,
+                     style=f_style(i_lvlStyle), width=rk))
+                array.push(mBox, i_showZones ?
+                     box.new(bar_index, px + i_buffer, bar_index + 1, px - i_buffer,
+                          xloc=xloc.bar_index, extend=extend.right,
+                          border_color=color.new(col, 80), border_width=1,
+                          bgcolor=color.new(col, 92)) : box(na))
+                array.push(mLab, label.new(bar_index, px, "",
+                     xloc=xloc.bar_index, style=label.style_label_left,
+                     color=color.new(col, 60), textcolor=color.white, size=size.small))
+    if array.size(mLab) > 0
+        for i = 0 to array.size(mLab) - 1
+            label.set_text(array.get(mLab, i), f_mLabelTxt(i))
+
+// Flip S↔R al superamento confermato + tocco zona
+bool evFlip  = false
+bool anyTouch= false
+if array.size(mPrice) > 0
+    for i = 0 to array.size(mPrice) - 1
+        float px  = array.get(mPrice, i)
+        int  role = array.get(mRole, i)
+        if high >= px - i_buffer and low <= px + i_buffer
+            anyTouch := true
+        if barstate.isconfirmed and i_useFlip
+            bool beyond = role == 1 ? close < px - i_buffer : close > px + i_buffer
+            int  cnt    = beyond ? array.get(mCnt, i) + 1 : 0
+            array.set(mCnt, i, cnt)
+            if cnt >= i_flipCloses
+                int newRole = role == 1 ? 0 : 1
+                array.set(mRole, i, newRole)
+                array.set(mCnt,  i, 0)
+                color col = newRole == 1 ? i_supCol : i_resCol
+                line.set_color(array.get(mLine, i), col)
+                if not na(array.get(mBox, i))
+                    box.set_border_color(array.get(mBox, i), color.new(col, 80))
+                    box.set_bgcolor    (array.get(mBox, i), color.new(col, 92))
+                label.set_color(array.get(mLab, i), color.new(col, 60))
+                label.set_text (array.get(mLab, i), f_mLabelTxt(i) + " (flip)")
+                evFlip := true
+
+if barstate.islast and array.size(mLab) > 0
+    for i = 0 to array.size(mLab) - 1
+        label.set_x(array.get(mLab, i), bar_index + 3)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  M O D U L O  2  –  M I N I M I   S I G N I F I C A T I V I   (auto)
+// ════════════════════════════════════════════════════════════════════════════
+f_pivSrc() =>
+    float p = ta.pivotlow(low, i_pivL, i_pivR)
+    [p, time[i_pivR]]
+
+[htfPiv, htfPivT] = request.security(syminfo.tickerid, i_slTF, f_pivSrc(), lookahead=barmerge.lookahead_off)
+[pdLow,  pdHigh]  = request.security(syminfo.tickerid, "D", [low[1], high[1]], lookahead=barmerge.lookahead_off)
+
+// PDL / PDH del giorno
+var float pdlLvl      = na
+var float pdhLvl      = na
+var bool  pdlConsumed = false
+var line  pdlLine     = na
+var line  pdhLine     = na
+var label pdlLab      = na
+if newDay
+    pdlConsumed := false
+    line.delete(pdlLine)
+    line.delete(pdhLine)
+    label.delete(pdlLab)
+    pdlLvl := i_usePDL ? pdLow : na
+    pdhLvl := pdHigh
+    if not na(pdlLvl)
+        pdlLine := line.new(bar_index, pdlLvl, bar_index + 1, pdlLvl,
+             xloc=xloc.bar_index, extend=extend.right, color=i_pdlCol,
+             style=line.style_solid, width=2)
+        if i_showLbls
+            pdlLab := label.new(bar_index, pdlLvl, "PDL " + str.tostring(pdlLvl, FMT),
+                 xloc=xloc.bar_index, style=label.style_label_right,
+                 color=color.new(i_pdlCol, 60), textcolor=color.white, size=size.tiny)
+    if not na(pdhLvl)
+        pdhLine := line.new(bar_index, pdhLvl, bar_index + 1, pdhLvl,
+             xloc=xloc.bar_index, extend=extend.right, color=i_pdlCol,
+             style=line.style_dotted, width=1)
+
+// Candidati pivot in attesa della reazione ≥ 20 pt
+var array<float> cLow  = array.new<float>()
+var array<float> cHi   = array.new<float>()      // massimo raggiunto dopo il pivot
+var array<int>   cTime = array.new<int>()
+var array<int>   cDay  = array.new<int>()
+
+// Minimi significativi qualificati / in attesa di validazione
+var array<float> slLvl = array.new<float>()
+var array<int>   slT   = array.new<int>()
+var array<int>   slDay = array.new<int>()
+var array<int>   slQ   = array.new<int>()        // 1 = validato (sessione precedente)
+var array<line>  slLn  = array.new<line>()
+var array<label> slLb  = array.new<label>()
+
+// Resistenze da flip automatico (supporti ceduti) → usate per i target
+var array<float> autoRes = array.new<float>()
+
+var int lastPivT = -1
+bool newPivot = not na(htfPiv) and htfPivT != lastPivT
+if newPivot
+    lastPivT := htfPivT
+    array.push(cLow,  htfPiv)
+    array.push(cHi,   recentHi)
+    array.push(cTime, htfPivT)
+    array.push(cDay,  dayId)
+
+// Promozione (reazione raggiunta) o scarto (nuovo minimo) dei candidati
+if array.size(cLow) > 0
+    for i = array.size(cLow) - 1 to 0
+        float cl = array.get(cLow, i)
+        if low < cl - syminfo.mintick
+            array.remove(cLow, i)
+            array.remove(cHi, i)
+            array.remove(cTime, i)
+            array.remove(cDay, i)
+        else
+            float chi = math.max(array.get(cHi, i), high)
+            array.set(cHi, i, chi)
+            if chi >= cl + i_reaction
+                bool dup = false
+                if array.size(slLvl) > 0
+                    for j = 0 to array.size(slLvl) - 1
+                        if math.abs(array.get(slLvl, j) - cl) < i_minGapSL
+                            dup := true
+                            break
+                if not dup
+                    bool qual = not i_requireVal or dayId > array.get(cDay, i)
+                    color col = qual ? i_slCol : i_slPendCol
+                    array.push(slLvl, cl)
+                    array.push(slT,   array.get(cTime, i))
+                    array.push(slDay, array.get(cDay, i))
+                    array.push(slQ,   qual ? 1 : 0)
+                    array.push(slLn, line.new(array.get(cTime, i), cl, time, cl,
+                         xloc=xloc.bar_time, extend=extend.right, color=col,
+                         style=line.style_dashed, width=1))
+                    array.push(slLb, i_showLbls ?
+                         label.new(array.get(cTime, i), cl, "SL " + str.tostring(cl, FMT) + (qual ? "" : " ⏳"),
+                              xloc=xloc.bar_time, style=label.style_label_up,
+                              color=color.new(col, 60), textcolor=color.white, size=size.tiny) : label(na))
+                    while array.size(slLvl) > i_maxSL
+                        line.delete (array.remove(slLn, 0))
+                        label.delete(array.remove(slLb, 0))
+                        array.remove(slLvl, 0)
+                        array.remove(slT, 0)
+                        array.remove(slDay, 0)
+                        array.remove(slQ, 0)
+                array.remove(cLow, i)
+                array.remove(cHi, i)
+                array.remove(cTime, i)
+                array.remove(cDay, i)
+
+// Validazione al cambio sessione (⏳ → qualificato)
+if newDay and array.size(slLvl) > 0
+    for i = 0 to array.size(slLvl) - 1
+        if array.get(slQ, i) == 0 and dayId > array.get(slDay, i)
+            array.set(slQ, i, 1)
+            line.set_color(array.get(slLn, i), i_slCol)
+            if not na(array.get(slLb, i))
+                label.set_color(array.get(slLb, i), color.new(i_slCol, 60))
+                label.set_text (array.get(slLb, i), "SL " + str.tostring(array.get(slLvl, i), FMT))
+
+// ════════════════════════════════════════════════════════════════════════════
+//  H E L P E R S   T A R G E T
+// ════════════════════════════════════════════════════════════════════════════
+f_nearestResAbove(float px) =>
+    float best = na
+    if array.size(mPrice) > 0
+        for i = 0 to array.size(mPrice) - 1
+            float p = array.get(mPrice, i)
+            if array.get(mRole, i) == 0 and p > px and (na(best) or p < best)
+                best := p
+    if array.size(autoRes) > 0
+        for i = 0 to array.size(autoRes) - 1
+            float p = array.get(autoRes, i)
+            if p > px and (na(best) or p < best)
+                best := p
+    if not na(pdhLvl) and pdhLvl > px and (na(best) or pdhLvl < best)
+        best := pdhLvl
+    best
+
+// ════════════════════════════════════════════════════════════════════════════
+//  M O D U L I  3 + 4  –  M O T O R E   F B   &   A C C E T T A Z I O N E
+//  Stati: 0 NEUTRO · 1 BREAKDOWN · 2 RECUPERO · 3 TRAPPOLA (ricaduta sotto)
+// ════════════════════════════════════════════════════════════════════════════
+var int   st          = 0
+var float fbLevel     = na
+var int   fbSrc       = -1        // 0 = minimo auto, 1 = PDL, 2 = supporto manuale (LR)
+var float fbLow       = na
+var float fbVolR      = na
+var int   cntBelow    = 0
+var float candCHigh   = na
+var bool  bosDone     = false
+var bool  btTouched   = false
+var bool  deepFlagged = false
+var int   naT0        = na
+var box   dzBox       = na
+var int   lastReset   = 0
+
+// Eventi del bar corrente (per plot e alert)
+bool evTouch   = anyTouch and not anyTouch[1]
+bool evBkd     = false
+bool evDeep    = false
+bool evReclaim = false
+bool evBOS     = false
+bool evAcc1    = false
+bool evAcc2    = false
+bool evAccNA   = false
+bool evEntry   = false
+bool evInval   = false
+
+int  fireEntry = 0                 // 1 T1 · 2 T2 · 3 non-accettazione · 4 BOS fast-track · 5 aggressiva · 6 BOS
+bool fireInval = false
+string invalWhy = ""
+
+bool modeAcc  = i_entryMode == "Accettazione (Tipo 1 / Tipo 2 / NA)"
+bool modeBOS  = i_entryMode == "BOS dopo il recupero (conservativa)"
+bool modeAggr = i_entryMode == "Chiusura di recupero (aggressiva)"
+
+if barstate.isconfirmed
+    // ── STATO 0: ricerca del breakdown ────────────────────────────────────────
+    if st == 0 and bar_index > lastReset + COOLDOWN and
+         (not i_useKZ or inKZ) and (not i_useMode or not mode1Dn) and
+         (not i_useVol or nz(volRatio) >= i_volMult)
+        float trig  = i_bkdClose ? close : low
+        float pTrig = i_bkdClose ? nz(close[1], close) : nz(low[1], low)
+        float best  = na
+        int   bSrc  = -1
+        if array.size(slLvl) > 0
+            for i = 0 to array.size(slLvl) - 1
+                float lvl = array.get(slLvl, i)
+                if array.get(slQ, i) == 1 and trig < lvl and pTrig >= lvl and (na(best) or lvl > best)
+                    best := lvl
+                    bSrc := 0
+        if i_usePDL and not pdlConsumed and not na(pdlLvl) and trig < pdlLvl and pTrig >= pdlLvl and (na(best) or pdlLvl > best)
+            best := pdlLvl
+            bSrc := 1
+        if i_lrManual and array.size(mPrice) > 0
+            for i = 0 to array.size(mPrice) - 1
+                float lvl = array.get(mPrice, i)
+                if array.get(mRole, i) == 1 and trig < lvl and pTrig >= lvl and (na(best) or lvl > best)
+                    best := lvl
+                    bSrc := 2
+        if not na(best)
+            st          := 1
+            fbLevel     := best
+            fbSrc       := bSrc
+            fbLow       := low
+            fbVolR      := volRatio
+            cntBelow    := close < best ? 1 : 0
+            candCHigh   := na
+            bosDone     := false
+            btTouched   := false
+            deepFlagged := false
+            naT0        := na
+            evBkd       := true
+            // Hammer: spike sotto e chiusura già sopra nello stesso bar
+            if close > fbLevel
+                st        := 2
+                candCHigh := high
+                cntBelow  := 0
+                evReclaim := true
+                if modeAggr
+                    fireEntry := 5
+
+    // ── STATO 1: breakdown attivo (stop hunt in corso) ───────────────────────
+    else if st == 1
+        fbLow := math.min(fbLow, low)
+        float depth = fbLevel - fbLow
+        if not deepFlagged and depth > i_shallowMax
+            deepFlagged := true
+            evDeep      := true
+        if close > fbLevel
+            st        := 2
+            candCHigh := high
+            cntBelow  := 0
+            btTouched := false
+            naT0      := na
+            evReclaim := true
+            if modeAggr
+                fireEntry := 5
+        else
+            cntBelow += close < fbLevel ? 1 : 0
+            if depth > i_maxDepth
+                fireInval := true
+                invalWhy  := "flush > " + str.tostring(i_maxDepth, "#") + " pt senza recupero"
+            else if cntBelow >= i_invalClose
+                fireInval := true
+                invalWhy  := str.tostring(cntBelow) + " chiusure sotto il livello"
+
+    // ── STATO 2: recupero avvenuto, attesa accettazione / BOS ────────────────
+    else if st == 2
+        fbLow := math.min(fbLow, low)
+        float depth = fbLevel - fbLow
+        if not bosDone and high > candCHigh
+            bosDone := true
+            evBOS   := true
+            if modeBOS
+                fireEntry := 6
+            else if modeAcc and depth <= i_fastDepth
+                fireEntry := 4
+        if fireEntry == 0
+            if close < fbLevel
+                cntBelow += 1
+                if cntBelow >= i_invalClose
+                    fireInval := true
+                    invalWhy  := str.tostring(cntBelow) + " chiusure sotto il livello"
+                else if depth > i_maxDepth
+                    fireInval := true
+                    invalWhy  := "flush > " + str.tostring(i_maxDepth, "#") + " pt"
+                else
+                    st := 3
+            else
+                cntBelow := 0
+                if modeAcc
+                    // Tipo 1: backtest del minimo dall'alto e rimbalzo
+                    if low <= fbLevel + i_btTol and close > fbLevel
+                        btTouched := true
+                    else if btTouched and close > fbLevel
+                        fireEntry := 1
+                    // Non-accettazione: subito oltre la zona di pericolo e vi rimane
+                    if fireEntry == 0
+                        if low > fbLevel + i_danger
+                            if na(naT0)
+                                naT0 := time
+                            else if time - naT0 >= i_naMin * 60000
+                                fireEntry := 3
+                        else
+                            naT0 := na
+
+    // ── STATO 3: ricaduta sotto (trappola) → attesa del secondo recupero ─────
+    else if st == 3
+        fbLow := math.min(fbLow, low)
+        float depth = fbLevel - fbLow
+        if not deepFlagged and depth > i_shallowMax
+            deepFlagged := true
+            evDeep      := true
+        if close > fbLevel
+            cntBelow  := 0
+            candCHigh := high
+            naT0      := na
+            evReclaim := true
+            if modeAcc
+                fireEntry := 2          // Tipo 2: ingresso al secondo recupero
+            else
+                st      := 2
+                bosDone := false
+        else
+            cntBelow += 1
+            if depth > i_maxDepth
+                fireInval := true
+                invalWhy  := "flush > " + str.tostring(i_maxDepth, "#") + " pt"
+            else if cntBelow >= i_invalClose
+                fireInval := true
+                invalWhy  := str.tostring(cntBelow) + " chiusure sotto il livello"
+
+    // ── Zona di pericolo (0-5 pt sopra il minimo) ─────────────────────────────
+    if st == 2 and na(dzBox)
+        dzBox := box.new(bar_index, fbLevel + i_danger, bar_index + 1, fbLevel,
+             xloc=xloc.bar_index, border_color=color.new(i_dzCol, 40), border_width=1,
+             bgcolor=i_dzCol)
+    if not na(dzBox) and st != 0
+        box.set_right(dzBox, bar_index)
+
+    // ── Invalidazione: flip del livello ceduto (supporto → resistenza) ───────
+    if fireInval
+        evInval := true
+        if fbSrc == 0 and array.size(slLvl) > 0
+            for i = array.size(slLvl) - 1 to 0
+                if math.abs(array.get(slLvl, i) - fbLevel) <= syminfo.mintick
+                    line.set_color(array.get(slLn, i), i_resCol)
+                    line.set_style(array.get(slLn, i), line.style_dotted)
+                    if not na(array.get(slLb, i))
+                        label.set_color(array.get(slLb, i), color.new(i_resCol, 60))
+                        label.set_text (array.get(slLb, i), "R (flip) " + str.tostring(fbLevel, FMT))
+                    array.remove(slLn, i)
+                    array.remove(slLb, i)
+                    array.remove(slLvl, i)
+                    array.remove(slT, i)
+                    array.remove(slDay, i)
+                    array.remove(slQ, i)
+                    break
+            array.push(autoRes, fbLevel)
+            evFlip := true
+        if fbSrc == 1
+            pdlConsumed := true
+            if not na(pdlLine)
+                line.set_color(pdlLine, i_resCol)
+            array.push(autoRes, fbLevel)
+            evFlip := true
+        if fbSrc == 2 and i_useFlip and array.size(mPrice) > 0
+            for i = 0 to array.size(mPrice) - 1
+                if array.get(mRole, i) == 1 and math.abs(array.get(mPrice, i) - fbLevel) <= syminfo.mintick
+                    array.set(mRole, i, 0)
+                    line.set_color(array.get(mLine, i), i_resCol)
+                    if not na(array.get(mBox, i))
+                        box.set_border_color(array.get(mBox, i), color.new(i_resCol, 80))
+                        box.set_bgcolor    (array.get(mBox, i), color.new(i_resCol, 92))
+                    label.set_color(array.get(mLab, i), color.new(i_resCol, 60))
+                    label.set_text (array.get(mLab, i), f_mLabelTxt(i) + " (flip)")
+                    evFlip := true
+                    break
+        if i_showLbls
+            label.new(bar_index, low, "✖ FB INVALIDATO\n" + invalWhy +
+                 "\nLivello: " + str.tostring(fbLevel, FMT),
+                 style=label.style_label_up, color=color.new(i_invalCol, 20),
+                 textcolor=color.white, size=size.small)
+
+    // ── Trigger ENTRY ─────────────────────────────────────────────────────────
+    if fireEntry > 0
+        evEntry := true
+        evAcc1  := fireEntry == 1
+        evAcc2  := fireEntry == 2
+        evAccNA := fireEntry == 3
+        float depth   = fbLevel - fbLow
+        float entryPx = close
+        float stopPx  = fbLow - i_stopOff
+        float t1      = entryPx + i_t1Pts
+        float t2      = entryPx + i_t2Pts
+        if i_lvlTargets
+            float nr = f_nearestResAbove(entryPx + 5.0)
+            if not na(nr) and nr <= entryPx + i_t1Pts * 1.75
+                t1 := nr
+            if not na(pdhLvl) and pdhLvl > t1 + 5.0
+                t2 := pdhLvl
+        t2 := math.max(t2, t1 + 5.0)
+        string typeName = fireEntry == 1 ? "Accettazione Tipo 1 (backtest)" :
+             fireEntry == 2 ? "Accettazione Tipo 2 (doppio recupero)" :
+             fireEntry == 3 ? "Non-accettazione (oltre zona pericolo)" :
+             fireEntry == 4 ? "BOS fast-track (flush superficiale)" :
+             fireEntry == 5 ? "Aggressiva (chiusura candela C)" : "BOS (candela D)"
+        string depthCls = depth < i_shallowMax ? "shallow" : "deep"
+        string srcName  = fbSrc == 0 ? "Minimo significativo" : fbSrc == 1 ? "PDL" : "Level Reclaim (manuale)"
+        if i_showLbls
+            label.new(bar_index, low,
+                 "⚡ FB LONG – " + typeName +
+                 "\n" + srcName + ": " + str.tostring(fbLevel, FMT) +
+                 "\nFlush: " + str.tostring(depth, "#.##") + " pt (" + depthCls + ")" +
+                 "\nEntry: " + str.tostring(entryPx, FMT) +
+                 "\nStop: "  + str.tostring(stopPx, FMT) + " (−" + str.tostring(entryPx - stopPx, "#.##") + " pt)" +
+                 "\nT1: "    + str.tostring(t1, FMT) + "  ·  T2: " + str.tostring(t2, FMT) +
+                 "\nVol BD: " + (na(fbVolR) ? "n/d" : str.tostring(fbVolR, "#.##") + "×"),
+                 style=label.style_label_up, color=color.new(i_entryCol, 10),
+                 textcolor=color.black, size=size.small)
+            line.new(bar_index, entryPx, bar_index + 20, entryPx, color=color.new(#2962FF, 0), width=2)
+            line.new(bar_index, stopPx,  bar_index + 20, stopPx,  color=color.new(#EF5350, 0), width=2)
+            line.new(bar_index, t1,      bar_index + 20, t1,      color=color.new(#00E676, 0), width=1)
+            line.new(bar_index, t2,      bar_index + 20, t2,      color=color.new(#00E676, 0), width=1, style=line.style_dashed)
+        // Livello consumato: il minimo auto viene congelato, il PDL disattivato
+        if fbSrc == 0 and array.size(slLvl) > 0
+            for i = array.size(slLvl) - 1 to 0
+                if math.abs(array.get(slLvl, i) - fbLevel) <= syminfo.mintick
+                    line.set_extend(array.get(slLn, i), extend.none)
+                    line.set_x2    (array.get(slLn, i), time)
+                    array.remove(slLn, i)
+                    array.remove(slLb, i)
+                    array.remove(slLvl, i)
+                    array.remove(slT, i)
+                    array.remove(slDay, i)
+                    array.remove(slQ, i)
+                    break
+        if fbSrc == 1
+            pdlConsumed := true
+
+    // ── Reset macchina ────────────────────────────────────────────────────────
+    if fireEntry > 0 or fireInval
+        st        := 0
+        fbLevel   := na
+        fbSrc     := -1
+        fbLow     := na
+        fbVolR    := na
+        cntBelow  := 0
+        candCHigh := na
+        naT0      := na
+        dzBox     := na
+        lastReset := bar_index
+
+    // ── Pulizia: minimi auto travolti mentre la macchina era occupata ────────
+    if array.size(slLvl) > 0
+        for i = array.size(slLvl) - 1 to 0
+            float lvl = array.get(slLvl, i)
+            bool tracked = st != 0 and not na(fbLevel) and math.abs(lvl - fbLevel) <= syminfo.mintick
+            if not tracked and close < lvl - i_maxDepth
+                line.set_color(array.get(slLn, i), i_resCol)
+                line.set_style(array.get(slLn, i), line.style_dotted)
+                if not na(array.get(slLb, i))
+                    label.set_color(array.get(slLb, i), color.new(i_resCol, 60))
+                    label.set_text (array.get(slLb, i), "R (flip) " + str.tostring(lvl, FMT))
+                array.push(autoRes, lvl)
+                array.remove(slLn, i)
+                array.remove(slLb, i)
+                array.remove(slLvl, i)
+                array.remove(slT, i)
+                array.remove(slDay, i)
+                array.remove(slQ, i)
+                evFlip := true
+    while array.size(autoRes) > 10
+        array.remove(autoRes, 0)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  V I S U A L S
+// ════════════════════════════════════════════════════════════════════════════
+float fbDepthNow = st != 0 and not na(fbLevel) and not na(fbLow) ? fbLevel - fbLow : na
+
+bgcolor(i_showBG and (st == 1 or st == 3) ? color.new(#EF5350, 88) :
+     i_showBG and st == 2 ? color.new(#FFB300, 92) : na, title="Stato macchina FB")
+
+plotshape(evEntry,   title="Entry FB",      location=location.belowbar, style=shape.triangleup, color=i_entryCol, size=size.normal, text="FB",  textcolor=color.black)
+plotshape(evReclaim, title="Recupero (C)",  location=location.belowbar, style=shape.circle,     color=color.new(#FFB300, 0), size=size.tiny, text="C",   textcolor=color.white)
+plotshape(evBOS,     title="BOS (D)",       location=location.abovebar, style=shape.diamond,    color=color.new(#2962FF, 0), size=size.tiny, text="BOS", textcolor=color.white)
+plotshape(evInval,   title="FB invalidato", location=location.belowbar, style=shape.xcross,     color=i_invalCol, size=size.small)
+
+// ── Pannello di stato ─────────────────────────────────────────────────────────
+var table tb = table.new(position.top_right, 2, 11,
+     bgcolor=color.new(color.black, 75), border_color=color.new(color.gray, 50), border_width=1)
+
+if i_showTable and barstate.islast
+    string stName = st == 0 ? "NEUTRO" : st == 1 ? "⚠️ BREAKDOWN" : st == 2 ? "🔄 RECUPERO" : "🪤 TRAPPOLA"
+    color  stCol  = st == 0 ? color.gray : st == 1 ? color.red : st == 2 ? color.orange : color.yellow
+    string dCls   = na(fbDepthNow) ? "—" :
+         str.tostring(fbDepthNow, "#.##") + " pt (" + (fbDepthNow < i_shallowMax ? "shallow" : fbDepthNow <= i_maxDepth ? "deep" : "⚠ oltre max") + ")"
+    table.cell(tb, 0, 0, "MANCINI FB", text_color=color.white, text_size=size.small, bgcolor=color.new(#2962FF, 30), text_halign=text.align_center)
+    table.cell(tb, 1, 0, timeframe.period, text_color=color.white, text_size=size.small, bgcolor=color.new(#2962FF, 30), text_halign=text.align_center)
+    table.cell(tb, 0, 1, "Stato",          text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 1, stName,           text_color=stCol,        text_size=size.tiny)
+    table.cell(tb, 0, 2, "Livello attivo", text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 2, na(fbLevel) ? "—" : str.tostring(fbLevel, FMT), text_color=color.yellow, text_size=size.tiny)
+    table.cell(tb, 0, 3, "Flush",          text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 3, dCls,             text_color=color.white,  text_size=size.tiny)
+    table.cell(tb, 0, 4, "Chiusure sotto", text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 4, st == 0 ? "—" : str.tostring(cntBelow) + " / " + str.tostring(i_invalClose), text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 0, 5, "Vol breakdown",  text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 5, na(fbVolR) ? "—" : str.tostring(fbVolR, "#.##") + "×", text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 0, 6, "Killzone",       text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 6, inKZ ? "✓ attiva" : "✗", text_color=inKZ ? color.green : color.gray, text_size=size.tiny)
+    table.cell(tb, 0, 7, "Modalità",       text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 7, modeStr,          text_color=mode1Dn ? color.red : mode1Up ? color.green : color.aqua, text_size=size.tiny)
+    table.cell(tb, 0, 8, "Minimi attivi",  text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 8, str.tostring(array.size(slLvl)) + " / " + str.tostring(i_maxSL), text_color=color.white, text_size=size.tiny)
+    table.cell(tb, 0, 9, "PDL / PDH",      text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 9, (na(pdlLvl) ? "—" : str.tostring(pdlLvl, FMT)) + " / " + (na(pdhLvl) ? "—" : str.tostring(pdhLvl, FMT)), text_color=i_pdlCol, text_size=size.tiny)
+    table.cell(tb, 0, 10, "Ingresso",      text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 10, modeAcc ? "Accettazione" : modeBOS ? "BOS" : "Aggressiva", text_color=color.white, text_size=size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  M O D U L O  6  –  A L E R T
+// ════════════════════════════════════════════════════════════════════════════
+alertcondition(evTouch,   title="Mancini FB – Tocco zona S/R",
+     message="📍 {{ticker}} [{{interval}}]: il prezzo ha toccato una zona S/R manuale. Close: {{close}}")
+alertcondition(evBkd,     title="Mancini FB – Breakdown in corso",
+     message="⚠️ {{ticker}} [{{interval}}]: spike sotto un minimo significativo (stop hunt). In attesa del recupero. Close: {{close}}")
+alertcondition(evDeep,    title="Mancini FB – Flush profondo (deep)",
+     message="🔻 {{ticker}} [{{interval}}]: penetrazione oltre la soglia shallow/deep. Serve conferma forte (volume/absorption). Close: {{close}}")
+alertcondition(evReclaim, title="Mancini FB – Recupero del minimo (candela C)",
+     message="🔄 {{ticker}} [{{interval}}]: prima chiusura sopra il minimo significativo. Attesa accettazione. Close: {{close}}")
+alertcondition(evBOS,     title="Mancini FB – Break of Structure (candela D)",
+     message="💠 {{ticker}} [{{interval}}]: rottura del massimo della candela di recupero (BOS). Close: {{close}}")
+alertcondition(evAcc1,    title="Mancini FB – Accettazione Tipo 1",
+     message="✅ {{ticker}} [{{interval}}]: accettazione Tipo 1 (backtest dal basso). Via libera al long. Close: {{close}}")
+alertcondition(evAcc2,    title="Mancini FB – Accettazione Tipo 2",
+     message="✅ {{ticker}} [{{interval}}]: accettazione Tipo 2 (doppio recupero). Ingresso al secondo recupero. Close: {{close}}")
+alertcondition(evAccNA,   title="Mancini FB – Non-accettazione confermata",
+     message="🚀 {{ticker}} [{{interval}}]: prezzo stabile oltre la zona di pericolo (minimo +5 pt). Protocollo di non accettazione. Close: {{close}}")
+alertcondition(evEntry,   title="Mancini FB – Trigger ENTRY",
+     message="⚡ {{ticker}} [{{interval}}]: TRIGGER ENTRY Failed Breakdown. Verifica entry, stop e target sul grafico. Close: {{close}}")
+alertcondition(evInval,   title="Mancini FB – Setup invalidato",
+     message="✖ {{ticker}} [{{interval}}]: Failed Breakdown invalidato (chiusure sotto il livello o flush oltre il massimo). Close: {{close}}")
+alertcondition(evFlip,    title="Mancini FB – Flip di livello S↔R",
+     message="🔁 {{ticker}} [{{interval}}]: un livello ha cambiato ruolo (supporto↔resistenza). Close: {{close}}")
