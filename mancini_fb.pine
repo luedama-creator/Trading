@@ -103,10 +103,14 @@ i_invalClose = input.int   (3,    "Chiusure consecutive sotto il livello → inv
      tooltip="Il documento indica 2-3 chiusure (≈ 10-15 minuti ai margini del range).")
 i_useDB      = input.bool  (true, "Segnala test di tenuta senza rottura (DB)", group=G3,
      tooltip="Doppio minimo: il prezzo testa un livello qualificato entro la tolleranza SENZA violarlo, chiude sopra e poi rompe il massimo della candela di test. Non è un FB (manca lo stop hunt) ma il livello ha dimostrato tenuta: segnale positivo dedicato.")
-i_dbTol      = input.float (3.0,  "Tolleranza test DB (punti sopra il livello)", minval=0.5, step=0.5, group=G3,
-     tooltip="Il low della candela di test deve fermarsi entro N punti sopra il livello, senza scendere sotto.")
+i_dbTol      = input.float (5.0,  "Tolleranza test DB (punti sopra il livello)", minval=0.5, step=0.5, group=G3,
+     tooltip="Il low della candela di test deve fermarsi entro N punti sopra il livello.")
+i_dbUnder    = input.float (2.0,  "Sweep massimo sotto il livello nel test DB (punti)", minval=0.0, step=0.25, group=G3,
+     tooltip="Un doppio minimo può falsificare il livello di pochi punti e rientrare subito (sweep): entro questa soglia il test resta valido. Oltre, lo scenario è del motore FB.")
 i_dbWin      = input.int   (10,   "Barre di validità del test DB", minval=2, maxval=50, group=G3,
      tooltip="Se il massimo della candela di test non viene rotto entro N barre, il test decade.")
+i_dbOnPending= input.bool  (true, "DB anche su minimi non ancora validati (⏳)", group=G3,
+     tooltip="La validazione in sessione precedente resta obbligatoria per i Failed Breakdown; per i doppi minimi intraday viene rilassata: il primo minimo del pattern si forma quasi sempre nella stessa seduta.")
 
 // ── 4. Accettazione ──────────────────────────────────────────────────────────
 i_entryMode  = input.string("Accettazione (Tipo 1 / Tipo 2 / NA)", "Modalità ingresso",
@@ -370,6 +374,8 @@ var array<int>   oldDay = array.new<int>()
 var array<label> sigLb  = array.new<label>()
 var array<line>  sigLn  = array.new<line>()
 var array<label> invLb  = array.new<label>()
+var array<label> dbLb   = array.new<label>()   // triangoli DB (tooltip con i dettagli)
+var array<line>  dbLn   = array.new<line>()    // linee entry/stop/target dei DB
 
 var int lastPivT = -1
 bool newPivot = not na(htfPiv) and htfPivT != lastPivT
@@ -813,17 +819,19 @@ if barstate.isconfirmed
     // (manca lo stop hunt) ma un segnale di tenuta. Trigger = rottura del
     // massimo della candela di test.
     if i_useDB
-        // Disarmo: livello violato (scenario FB), test scaduto o macchina occupata
-        if not na(dbLvl) and (low < dbLvl or bar_index - dbBar > i_dbWin or st != 0)
+        // Disarmo: sweep oltre la soglia (scenario FB), test scaduto, oppure
+        // la macchina FB sta lavorando proprio su questo livello
+        bool dbBusy = not na(dbLvl) and st != 0 and not na(fbLevel) and math.abs(dbLvl - fbLevel) <= syminfo.mintick
+        if not na(dbLvl) and (low < dbLvl - i_dbUnder or bar_index - dbBar > i_dbWin or dbBusy)
             dbLvl := na
-        // Trigger
-        if not na(dbLvl) and st == 0 and high > dbHigh
+        // Trigger: rottura del massimo della candela di test
+        if not na(dbLvl) and high > dbHigh and close > dbLvl
             float entryPx = close
             if i_maxEntryDist > 0.0 and entryPx - dbLvl > i_maxEntryDist
                 dbLvl := na
             else
                 evDB := true
-                float stopPx = dbLvl - i_stopOff
+                float stopPx = math.min(dbLvl, dbLow) - i_stopOff
                 float t1     = entryPx + i_t1Pts
                 float t2     = entryPx + i_t2Pts
                 if i_lvlTargets
@@ -835,43 +843,42 @@ if barstate.isconfirmed
                 t2 := math.max(t2, t1 + 5.0)
                 string dbTxt = "◎ DB LONG – Test di tenuta (doppio minimo)" +
                      "\nLivello: " + str.tostring(dbLvl, FMT) +
-                     "\nTest low: " + str.tostring(dbLow, FMT) + " (nessuna rottura)" +
+                     "\nTest low: " + str.tostring(dbLow, FMT) +
                      "\nEntry: " + str.tostring(entryPx, FMT) +
                      "\nStop: "  + str.tostring(stopPx, FMT) + " (−" + str.tostring(entryPx - stopPx, "#.##") + " pt)" +
                      "\nT1: "    + str.tostring(t1, FMT) + "  ·  T2: " + str.tostring(t2, FMT)
-                if i_showLbls
-                    array.push(sigLb, label.new(bar_index, lblY,
-                         i_compactLbl ? "◎ DB" : dbTxt,
-                         style=label.style_label_up, color=color.new(i_dbCol, 10),
-                         textcolor=color.black, size=f_size(i_szSignals), tooltip=dbTxt))
-                    array.push(sigLn, line.new(bar_index, entryPx, bar_index + 20, entryPx, color=color.new(#2962FF, 0), width=2))
-                    array.push(sigLn, line.new(bar_index, stopPx,  bar_index + 20, stopPx,  color=color.new(#EF5350, 0), width=2))
-                    array.push(sigLn, line.new(bar_index, t1,      bar_index + 20, t1,      color=color.new(#00E676, 0), width=1))
-                    array.push(sigLn, line.new(bar_index, t2,      bar_index + 20, t2,      color=color.new(#00E676, 0), width=1, style=line.style_dashed))
-                    while array.size(sigLb) > i_maxSignals
-                        label.delete(array.remove(sigLb, 0))
-                    while array.size(sigLn) > i_maxSignals * 4
-                        line.delete(array.remove(sigLn, 0))
+                array.push(dbLb, label.new(bar_index, na, "",
+                     yloc=yloc.belowbar, style=label.style_triangleup,
+                     color=i_dbCol, size=size.small, tooltip=dbTxt))
+                array.push(dbLn, line.new(bar_index, entryPx, bar_index + 20, entryPx, color=color.new(#2962FF, 0), width=2))
+                array.push(dbLn, line.new(bar_index, stopPx,  bar_index + 20, stopPx,  color=color.new(#EF5350, 0), width=2))
+                array.push(dbLn, line.new(bar_index, t1,      bar_index + 20, t1,      color=color.new(#00E676, 0), width=1))
+                array.push(dbLn, line.new(bar_index, t2,      bar_index + 20, t2,      color=color.new(#00E676, 0), width=1, style=line.style_dashed))
+                while array.size(dbLb) > i_maxSignals
+                    label.delete(array.remove(dbLb, 0))
+                while array.size(dbLn) > i_maxSignals * 4
+                    line.delete(array.remove(dbLn, 0))
                 dbCoolLvl := dbLvl
                 dbCoolBar := bar_index + 30
                 dbLvl     := na
-        // Armamento / aggiornamento del test (solo a macchina FB inattiva)
-        if st == 0 and (not i_useKZ or inKZ) and (not i_useMode or not mode1Dn)
+        // Armamento / aggiornamento del test
+        if (not i_useKZ or inKZ) and (not i_useMode or not mode1Dn)
             float bestDb = na
             if array.size(slLvl) > 0
                 for i = 0 to array.size(slLvl) - 1
                     float lvl = array.get(slLvl, i)
-                    if array.get(slQ, i) == 1 and low >= lvl and low <= lvl + i_dbTol and close > lvl and (na(bestDb) or lvl > bestDb)
+                    if (array.get(slQ, i) == 1 or i_dbOnPending) and low >= lvl - i_dbUnder and low <= lvl + i_dbTol and close > lvl and (na(bestDb) or lvl > bestDb)
                         bestDb := lvl
-            if i_usePDL and not na(pdlLvl) and low >= pdlLvl and low <= pdlLvl + i_dbTol and close > pdlLvl and (na(bestDb) or pdlLvl > bestDb)
+            if i_usePDL and not na(pdlLvl) and low >= pdlLvl - i_dbUnder and low <= pdlLvl + i_dbTol and close > pdlLvl and (na(bestDb) or pdlLvl > bestDb)
                 bestDb := pdlLvl
             if i_lrManual and array.size(mPrice) > 0
                 for i = 0 to array.size(mPrice) - 1
                     float lvl = array.get(mPrice, i)
-                    if array.get(mRole, i) == 1 and low >= lvl and low <= lvl + i_dbTol and close > lvl and (na(bestDb) or lvl > bestDb)
+                    if array.get(mRole, i) == 1 and low >= lvl - i_dbUnder and low <= lvl + i_dbTol and close > lvl and (na(bestDb) or lvl > bestDb)
                         bestDb := lvl
-            bool inCool = not na(bestDb) and not na(dbCoolLvl) and math.abs(bestDb - dbCoolLvl) <= syminfo.mintick and bar_index < dbCoolBar
-            if not na(bestDb) and not inCool
+            bool inCool  = not na(bestDb) and not na(dbCoolLvl) and math.abs(bestDb - dbCoolLvl) <= syminfo.mintick and bar_index < dbCoolBar
+            bool fbOnLvl = not na(bestDb) and st != 0 and not na(fbLevel) and math.abs(bestDb - fbLevel) <= syminfo.mintick
+            if not na(bestDb) and not inCool and not fbOnLvl
                 if na(dbLvl) or math.abs(bestDb - dbLvl) > syminfo.mintick
                     dbLvl  := bestDb
                     dbLow  := low
@@ -922,7 +929,7 @@ plotshape(evEntry,   title="Entry FB",      location=location.belowbar, style=sh
 plotshape(evReclaim, title="Recupero (C)",  location=location.belowbar, style=shape.circle,     color=color.new(#FFB300, 0), size=size.tiny, text="C",   textcolor=color.white)
 plotshape(evBOS,     title="BOS (D)",       location=location.abovebar, style=shape.diamond,    color=color.new(#2962FF, 0), size=size.tiny, text="BOS", textcolor=color.white)
 plotshape(evInval,   title="FB invalidato", location=location.belowbar, style=shape.xcross,     color=i_invalCol, size=size.small)
-plotshape(evDB,      title="Test di tenuta (DB)", location=location.belowbar, style=shape.triangleup, color=i_dbCol, size=size.small, text="DB", textcolor=color.black)
+// Il segnale DB è disegnato come label-triangolo (tooltip con entry/stop/target)
 
 // ── Pannello di stato ─────────────────────────────────────────────────────────
 var table tb = table.new(position.top_right, 2, 11,
