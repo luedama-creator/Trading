@@ -103,14 +103,18 @@ i_invalClose = input.int   (3,    "Chiusure consecutive sotto il livello → inv
      tooltip="Il documento indica 2-3 chiusure (≈ 10-15 minuti ai margini del range).")
 i_useDB      = input.bool  (true, "Segnala test di tenuta senza rottura (DB)", group=G3,
      tooltip="Doppio minimo: il prezzo testa un livello qualificato entro la tolleranza SENZA violarlo, chiude sopra e poi rompe il massimo della candela di test. Non è un FB (manca lo stop hunt) ma il livello ha dimostrato tenuta: segnale positivo dedicato.")
-i_dbTol      = input.float (5.0,  "Tolleranza test DB (punti sopra il livello)", minval=0.5, step=0.5, group=G3,
-     tooltip="Il low della candela di test deve fermarsi entro N punti sopra il livello.")
+i_dbTol      = input.float (8.0,  "Tolleranza test DB (punti sopra il livello)", minval=0.5, step=0.5, group=G3,
+     tooltip="Il low della candela di test deve fermarsi entro N punti sopra il livello. I livelli sono zone (Mancini: 10-18 pt di tolleranza): il secondo minimo di un doppio minimo resta spesso 5-10 punti sopra il primo.")
 i_dbUnder    = input.float (2.0,  "Sweep massimo sotto il livello nel test DB (punti)", minval=0.0, step=0.25, group=G3,
      tooltip="Un doppio minimo può falsificare il livello di pochi punti e rientrare subito (sweep): entro questa soglia il test resta valido. Oltre, lo scenario è del motore FB.")
 i_dbWin      = input.int   (10,   "Barre di validità del test DB", minval=2, maxval=50, group=G3,
      tooltip="Se il massimo della candela di test non viene rotto entro N barre, il test decade.")
 i_dbOnPending= input.bool  (true, "DB anche su minimi non ancora validati (⏳)", group=G3,
      tooltip="La validazione in sessione precedente resta obbligatoria per i Failed Breakdown; per i doppi minimi intraday viene rilassata: il primo minimo del pattern si forma quasi sempre nella stessa seduta.")
+i_dbSessLow  = input.bool  (true, "DB anche sul minimo di seduta (doppio minimo puro)", group=G3,
+     tooltip="Il minimo di seduta è il riferimento naturale del doppio minimo intraday, anche quando non è (ancora) un livello registrato: secondo test entro la tolleranza → segnale DB.")
+i_dbMinGap   = input.int   (10,   "Distanza minima tra i due minimi (barre)", minval=2, maxval=100, group=G3,
+     tooltip="Il secondo test del minimo di seduta è valido solo se avviene almeno N barre dopo il primo minimo: distingue un vero doppio minimo dal semplice consolidamento sul low.")
 
 // ── 4. Accettazione ──────────────────────────────────────────────────────────
 i_entryMode  = input.string("Accettazione (Tipo 1 / Tipo 2 / NA)", "Modalità ingresso",
@@ -191,6 +195,18 @@ var int dayId = 0
 bool newDay   = timeframe.change("D")
 if newDay
     dayId += 1
+
+// Minimo di seduta: riferimento naturale del doppio minimo intraday.
+// Un semplice sweep entro la tolleranza non azzera l'età del minimo.
+var float sessLow    = na
+var int   sessLowBar = 0
+if newDay or na(sessLow)
+    sessLow    := low
+    sessLowBar := bar_index
+else if low < sessLow
+    if low < sessLow - i_dbUnder
+        sessLowBar := bar_index
+    sessLow := low
 
 // Stile linea dei livelli manuali
 f_style(string s) =>
@@ -841,8 +857,10 @@ if barstate.isconfirmed
                     if not na(pdhLvl) and pdhLvl > t1 + 5.0
                         t2 := pdhLvl
                 t2 := math.max(t2, t1 + 5.0)
+                string dbRef = not na(sessLow) and math.abs(dbLvl - sessLow) <= syminfo.mintick ?
+                     "Minimo di seduta" : "Livello"
                 string dbTxt = "◎ DB LONG – Test di tenuta (doppio minimo)" +
-                     "\nLivello: " + str.tostring(dbLvl, FMT) +
+                     "\n" + dbRef + ": " + str.tostring(dbLvl, FMT) +
                      "\nTest low: " + str.tostring(dbLow, FMT) +
                      "\nEntry: " + str.tostring(entryPx, FMT) +
                      "\nStop: "  + str.tostring(stopPx, FMT) + " (−" + str.tostring(entryPx - stopPx, "#.##") + " pt)" +
@@ -876,6 +894,12 @@ if barstate.isconfirmed
                     float lvl = array.get(mPrice, i)
                     if array.get(mRole, i) == 1 and low >= lvl - i_dbUnder and low <= lvl + i_dbTol and close > lvl and (na(bestDb) or lvl > bestDb)
                         bestDb := lvl
+            // Minimo di seduta: doppio minimo puro (il primo minimo deve essere
+            // abbastanza vecchio da distinguere il test dal consolidamento)
+            if i_dbSessLow and not na(sessLow) and bar_index - sessLowBar >= i_dbMinGap and
+                 low >= sessLow - i_dbUnder and low <= sessLow + i_dbTol and close > sessLow and
+                 (na(bestDb) or sessLow > bestDb)
+                bestDb := sessLow
             bool inCool  = not na(bestDb) and not na(dbCoolLvl) and math.abs(bestDb - dbCoolLvl) <= syminfo.mintick and bar_index < dbCoolBar
             bool fbOnLvl = not na(bestDb) and st != 0 and not na(fbLevel) and math.abs(bestDb - fbLevel) <= syminfo.mintick
             if not na(bestDb) and not inCool and not fbOnLvl
