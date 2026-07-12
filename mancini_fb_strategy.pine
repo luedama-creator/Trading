@@ -62,6 +62,8 @@ strategy("Mancini FB – Strategy (backtest)",
      pyramiding              = 0,
      process_orders_on_close = false,
      calc_on_order_fills     = false,
+     margin_long             = 0,
+     margin_short            = 0,
      max_lines_count         = 500,
      max_labels_count        = 500,
      max_boxes_count         = 250)
