@@ -115,6 +115,8 @@ i_dbSessLow  = input.bool  (true, "DB anche sul minimo di seduta (doppio minimo 
      tooltip="Il minimo di seduta è il riferimento naturale del doppio minimo intraday, anche quando non è (ancora) un livello registrato: secondo test entro la tolleranza → segnale DB.")
 i_dbMinGap   = input.int   (10,   "Distanza minima tra i due minimi (barre)", minval=2, maxval=100, group=G3,
      tooltip="Il secondo test del minimo di seduta è valido solo se avviene almeno N barre dopo il primo minimo: distingue un vero doppio minimo dal semplice consolidamento sul low.")
+i_dbCool     = input.int   (20,   "Cooldown DB sullo stesso livello (barre)", minval=0, maxval=200, group=G3,
+     tooltip="Dopo un segnale DB lo stesso livello resta silenziato per N barre.")
 
 // ── 4. Accettazione ──────────────────────────────────────────────────────────
 i_entryMode  = input.string("Accettazione (Tipo 1 / Tipo 2 / NA)", "Modalità ingresso",
@@ -840,12 +842,13 @@ if barstate.isconfirmed
         bool dbBusy = not na(dbLvl) and st != 0 and not na(fbLevel) and math.abs(dbLvl - fbLevel) <= syminfo.mintick
         if not na(dbLvl) and (low < dbLvl - i_dbUnder or bar_index - dbBar > i_dbWin or dbBusy)
             dbLvl := na
-        // Trigger: rottura del massimo della candela di test
+        // Trigger: rottura del massimo della candela con il low più basso del test.
+        // La distanza massima dell'entry si misura dal low del test (ancora di
+        // rischio del doppio minimo); un trigger troppo lontano NON disarma il
+        // test: si attende una conferma più vicina finché la finestra è valida.
         if not na(dbLvl) and high > dbHigh and close > dbLvl
             float entryPx = close
-            if i_maxEntryDist > 0.0 and entryPx - dbLvl > i_maxEntryDist
-                dbLvl := na
-            else
+            if not (i_maxEntryDist > 0.0 and entryPx - dbLow > i_maxEntryDist)
                 evDB := true
                 float stopPx = math.min(dbLvl, dbLow) - i_stopOff
                 float t1     = entryPx + i_t1Pts
@@ -877,7 +880,7 @@ if barstate.isconfirmed
                 while array.size(dbLn) > i_maxSignals * 4
                     line.delete(array.remove(dbLn, 0))
                 dbCoolLvl := dbLvl
-                dbCoolBar := bar_index + 30
+                dbCoolBar := bar_index + i_dbCool
                 dbLvl     := na
         // Armamento / aggiornamento del test
         if (not i_useKZ or inKZ) and (not i_useMode or not mode1Dn)
@@ -909,10 +912,12 @@ if barstate.isconfirmed
                     dbHigh := high
                     dbBar  := bar_index
                 else
-                    // Nuovo test sullo stesso livello: aggiorna trigger e finestra
-                    dbLow  := math.min(dbLow, low)
-                    dbHigh := high
-                    dbBar  := bar_index
+                    // Nuovo test sullo stesso livello: il trigger resta ancorato
+                    // alla candela con il low più basso (il vero secondo minimo)
+                    if low <= dbLow
+                        dbLow  := low
+                        dbHigh := high
+                    dbBar := bar_index
 
     // ── Pulizia: minimi auto travolti mentre la macchina era occupata ────────
     if array.size(slLvl) > 0
