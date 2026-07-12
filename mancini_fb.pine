@@ -68,6 +68,8 @@ i_flipCloses = input.int   (2,    "Chiusure oltre il buffer per confermare il fl
 i_lrManual   = input.bool  (true, "Usa i supporti manuali nel motore FB (Level Reclaim)", group=G1,
      tooltip="Variante Level Reclaim (sez. 4.4): stessa logica del FB su una linea S/R orizzontale.")
 i_showZones  = input.bool  (true, "Mostra zone (box con buffer)", group=G1)
+i_zoneDist   = input.float (30.0, "Mostra zone solo entro N punti dal prezzo (0 = sempre)", minval=0.0, step=5.0, group=G1,
+     tooltip="I livelli lontani restano come semplice linea; la zona colorata si accende solo quando il prezzo si avvicina. Riduce drasticamente l'affollamento con molti livelli in lista.")
 i_supCol     = input.color (color.new(#26A69A, 0),  "Colore supporti manuali",   group=G1)
 i_resCol     = input.color (color.new(#EF5350, 0),  "Colore resistenze manuali", group=G1)
 i_lvlStyle   = input.string("Continua", "Stile linea livelli manuali", options=["Continua", "Tratteggiata", "Punteggiata"], group=G1)
@@ -121,6 +123,8 @@ i_t1Pts      = input.float (20.0, "Target 1 di default (punti)", minval=1.0, gro
 i_t2Pts      = input.float (40.0, "Target 2 di default (punti)", minval=1.0, group=G5,
      tooltip="Swing high di sessione o PDH (+35-50 punti), solo con contesto rialzista.")
 i_lvlTargets = input.bool  (true, "Usa i livelli (R manuali / flip / PDH) come target", group=G5)
+i_maxEntryDist = input.float(15.0, "Scarta entry oltre N punti dal livello (0 = off)", minval=0.0, step=1.0, group=G5,
+     tooltip="Se al momento del trigger il prezzo è già oltre N punti sopra il minimo, il setup è considerato mancato: rischio oltre il massimo Mancini (15 pt). Nessun segnale viene emesso.")
 
 // ── 6. Filtri di contesto ────────────────────────────────────────────────────
 i_useKZ      = input.bool   (false,       "Rileva breakdown solo in killzone", group=G6)
@@ -138,6 +142,10 @@ i_modeMult   = input.float  (3.0,   "Soglia trend (× ATR14)", minval=0.5, step=
 i_showTable  = input.bool  (true, "Mostra pannello di stato", group=G7)
 i_showLbls   = input.bool  (true, "Mostra etichette", group=G7)
 i_showBG     = input.bool  (true, "Sfondo durante breakdown / recupero", group=G7)
+i_maxSignals = input.int   (3,    "Mostra solo gli ultimi N segnali", minval=1, maxval=20, group=G7,
+     tooltip="Etichette e linee di entry/invalidazione più vecchie vengono rimosse dal grafico.")
+i_compactLbl = input.bool  (true, "Etichette segnali compatte (dettagli nel tooltip)", group=G7,
+     tooltip="ON = sul grafico compare solo un tag breve (es. ⚡ FB NA); tutti i dettagli appaiono passando il mouse sull'etichetta.")
 i_szLevels   = input.string("Piccolo",  "Dimensione testo livelli (SL / PDL / manuali)", options=["Minuscolo", "Piccolo", "Normale", "Grande"], group=G7)
 i_szSignals  = input.string("Normale",  "Dimensione testo segnali (entry / invalidazione)", options=["Minuscolo", "Piccolo", "Normale", "Grande"], group=G7)
 i_szTable    = input.string("Piccolo",  "Dimensione testo pannello di stato", options=["Minuscolo", "Piccolo", "Normale", "Grande"], group=G7)
@@ -252,6 +260,12 @@ if array.size(mPrice) > 0
         int  role = array.get(mRole, i)
         if high >= px - i_buffer and low <= px + i_buffer
             anyTouch := true
+        // Zona visibile solo se il prezzo è vicino al livello
+        if not na(array.get(mBox, i))
+            bool nearPx = i_zoneDist <= 0.0 or math.abs(close - px) <= i_zoneDist
+            color colV  = role == 1 ? i_supCol : i_resCol
+            box.set_bgcolor     (array.get(mBox, i), color.new(colV, nearPx ? 92 : 100))
+            box.set_border_color(array.get(mBox, i), color.new(colV, nearPx ? 80 : 100))
         if barstate.isconfirmed and i_useFlip
             bool beyond = role == 1 ? close < px - i_buffer : close > px + i_buffer
             int  cnt    = beyond ? array.get(mCnt, i) + 1 : 0
@@ -327,6 +341,16 @@ var array<label> slLb  = array.new<label>()
 // Resistenze da flip automatico (supporti ceduti) → usate per i target
 var array<float> autoRes = array.new<float>()
 
+// Disegni "storici" (livelli flippati o consumati) da eliminare dopo N sedute
+var array<line>  oldLn  = array.new<line>()
+var array<label> oldLb  = array.new<label>()
+var array<int>   oldDay = array.new<int>()
+
+// Disegni dei segnali: si mantengono solo gli ultimi N
+var array<label> sigLb  = array.new<label>()
+var array<line>  sigLn  = array.new<line>()
+var array<label> invLb  = array.new<label>()
+
 var int lastPivT = -1
 bool newPivot = not na(htfPiv) and htfPivT != lastPivT
 if newPivot
@@ -380,6 +404,16 @@ if array.size(cLow) > 0
                 array.remove(cHi, i)
                 array.remove(cTime, i)
                 array.remove(cDay, i)
+
+// Scadenza al cambio sessione: rimuove i disegni storici (flip/consumati)
+if newDay and array.size(oldDay) > 0
+    for i = array.size(oldDay) - 1 to 0
+        if dayId - array.get(oldDay, i) > i_slAgeMax
+            line.delete (array.get(oldLn, i))
+            label.delete(array.get(oldLb, i))
+            array.remove(oldLn, i)
+            array.remove(oldLb, i)
+            array.remove(oldDay, i)
 
 // Scadenza al cambio sessione: rimuove i minimi più vecchi di N sedute
 if newDay and array.size(slLvl) > 0
@@ -612,11 +646,16 @@ if barstate.isconfirmed
         if fbSrc == 0 and array.size(slLvl) > 0
             for i = array.size(slLvl) - 1 to 0
                 if math.abs(array.get(slLvl, i) - fbLevel) <= syminfo.mintick
-                    line.set_color(array.get(slLn, i), i_resCol)
-                    line.set_style(array.get(slLn, i), line.style_dotted)
+                    line.set_color (array.get(slLn, i), i_resCol)
+                    line.set_style (array.get(slLn, i), line.style_dotted)
+                    line.set_extend(array.get(slLn, i), extend.none)
+                    line.set_x2    (array.get(slLn, i), time)
                     if not na(array.get(slLb, i))
                         label.set_color(array.get(slLb, i), color.new(i_resCol, 60))
                         label.set_text (array.get(slLb, i), "R (flip) " + str.tostring(fbLevel, FMT))
+                    array.push(oldLn,  array.get(slLn, i))
+                    array.push(oldLb,  array.get(slLb, i))
+                    array.push(oldDay, dayId)
                     array.remove(slLn, i)
                     array.remove(slLb, i)
                     array.remove(slLvl, i)
@@ -645,10 +684,17 @@ if barstate.isconfirmed
                     evFlip := true
                     break
         if i_showLbls
-            label.new(bar_index, low, "✖ FB INVALIDATO\n" + invalWhy +
-                 "\nLivello: " + str.tostring(fbLevel, FMT),
+            string invTxt = "✖ FB INVALIDATO\n" + invalWhy + "\nLivello: " + str.tostring(fbLevel, FMT)
+            array.push(invLb, label.new(bar_index, low,
+                 i_compactLbl ? "✖ FB" : invTxt,
                  style=label.style_label_up, color=color.new(i_invalCol, 20),
-                 textcolor=color.white, size=f_size(i_szSignals))
+                 textcolor=color.white, size=f_size(i_szSignals), tooltip=invTxt))
+            while array.size(invLb) > i_maxSignals
+                label.delete(array.remove(invLb, 0))
+
+    // Entry mancata: prezzo già troppo lontano dal livello → rischio oltre il massimo
+    if fireEntry > 0 and i_maxEntryDist > 0.0 and close - fbLevel > i_maxEntryDist
+        fireEntry := -1
 
     // ── Trigger ENTRY ─────────────────────────────────────────────────────────
     if fireEntry > 0
@@ -673,29 +719,40 @@ if barstate.isconfirmed
              fireEntry == 3 ? "Non-accettazione (oltre zona pericolo)" :
              fireEntry == 4 ? "BOS fast-track (flush superficiale)" :
              fireEntry == 5 ? "Aggressiva (chiusura candela C)" : "BOS (candela D)"
+        string typeTag = fireEntry == 1 ? "T1" : fireEntry == 2 ? "T2" :
+             fireEntry == 3 ? "NA" : fireEntry == 4 ? "BOS⚡" :
+             fireEntry == 5 ? "C" : "BOS"
         string depthCls = depth < i_shallowMax ? "shallow" : "deep"
         string srcName  = fbSrc == 0 ? "Minimo significativo" : fbSrc == 1 ? "PDL" : "Level Reclaim (manuale)"
+        string fullTxt  = "⚡ FB LONG – " + typeName +
+             "\n" + srcName + ": " + str.tostring(fbLevel, FMT) +
+             "\nFlush: " + str.tostring(depth, "#.##") + " pt (" + depthCls + ")" +
+             "\nEntry: " + str.tostring(entryPx, FMT) +
+             "\nStop: "  + str.tostring(stopPx, FMT) + " (−" + str.tostring(entryPx - stopPx, "#.##") + " pt)" +
+             "\nT1: "    + str.tostring(t1, FMT) + "  ·  T2: " + str.tostring(t2, FMT) +
+             "\nVol BD: " + (na(fbVolR) ? "n/d" : str.tostring(fbVolR, "#.##") + "×")
         if i_showLbls
-            label.new(bar_index, low,
-                 "⚡ FB LONG – " + typeName +
-                 "\n" + srcName + ": " + str.tostring(fbLevel, FMT) +
-                 "\nFlush: " + str.tostring(depth, "#.##") + " pt (" + depthCls + ")" +
-                 "\nEntry: " + str.tostring(entryPx, FMT) +
-                 "\nStop: "  + str.tostring(stopPx, FMT) + " (−" + str.tostring(entryPx - stopPx, "#.##") + " pt)" +
-                 "\nT1: "    + str.tostring(t1, FMT) + "  ·  T2: " + str.tostring(t2, FMT) +
-                 "\nVol BD: " + (na(fbVolR) ? "n/d" : str.tostring(fbVolR, "#.##") + "×"),
+            array.push(sigLb, label.new(bar_index, low,
+                 i_compactLbl ? "⚡ FB " + typeTag : fullTxt,
                  style=label.style_label_up, color=color.new(i_entryCol, 10),
-                 textcolor=color.black, size=f_size(i_szSignals))
-            line.new(bar_index, entryPx, bar_index + 20, entryPx, color=color.new(#2962FF, 0), width=2)
-            line.new(bar_index, stopPx,  bar_index + 20, stopPx,  color=color.new(#EF5350, 0), width=2)
-            line.new(bar_index, t1,      bar_index + 20, t1,      color=color.new(#00E676, 0), width=1)
-            line.new(bar_index, t2,      bar_index + 20, t2,      color=color.new(#00E676, 0), width=1, style=line.style_dashed)
+                 textcolor=color.black, size=f_size(i_szSignals), tooltip=fullTxt))
+            array.push(sigLn, line.new(bar_index, entryPx, bar_index + 20, entryPx, color=color.new(#2962FF, 0), width=2))
+            array.push(sigLn, line.new(bar_index, stopPx,  bar_index + 20, stopPx,  color=color.new(#EF5350, 0), width=2))
+            array.push(sigLn, line.new(bar_index, t1,      bar_index + 20, t1,      color=color.new(#00E676, 0), width=1))
+            array.push(sigLn, line.new(bar_index, t2,      bar_index + 20, t2,      color=color.new(#00E676, 0), width=1, style=line.style_dashed))
+            while array.size(sigLb) > i_maxSignals
+                label.delete(array.remove(sigLb, 0))
+            while array.size(sigLn) > i_maxSignals * 4
+                line.delete(array.remove(sigLn, 0))
         // Livello consumato: il minimo auto viene congelato, il PDL disattivato
         if fbSrc == 0 and array.size(slLvl) > 0
             for i = array.size(slLvl) - 1 to 0
                 if math.abs(array.get(slLvl, i) - fbLevel) <= syminfo.mintick
                     line.set_extend(array.get(slLn, i), extend.none)
                     line.set_x2    (array.get(slLn, i), time)
+                    array.push(oldLn,  array.get(slLn, i))
+                    array.push(oldLb,  array.get(slLb, i))
+                    array.push(oldDay, dayId)
                     array.remove(slLn, i)
                     array.remove(slLb, i)
                     array.remove(slLvl, i)
@@ -707,7 +764,7 @@ if barstate.isconfirmed
             pdlConsumed := true
 
     // ── Reset macchina ────────────────────────────────────────────────────────
-    if fireEntry > 0 or fireInval
+    if fireEntry != 0 or fireInval
         st        := 0
         fbLevel   := na
         fbSrc     := -1
@@ -725,12 +782,17 @@ if barstate.isconfirmed
             float lvl = array.get(slLvl, i)
             bool tracked = st != 0 and not na(fbLevel) and math.abs(lvl - fbLevel) <= syminfo.mintick
             if not tracked and close < lvl - i_maxDepth
-                line.set_color(array.get(slLn, i), i_resCol)
-                line.set_style(array.get(slLn, i), line.style_dotted)
+                line.set_color (array.get(slLn, i), i_resCol)
+                line.set_style (array.get(slLn, i), line.style_dotted)
+                line.set_extend(array.get(slLn, i), extend.none)
+                line.set_x2    (array.get(slLn, i), time)
                 if not na(array.get(slLb, i))
                     label.set_color(array.get(slLb, i), color.new(i_resCol, 60))
                     label.set_text (array.get(slLb, i), "R (flip) " + str.tostring(lvl, FMT))
                 array.push(autoRes, lvl)
+                array.push(oldLn,  array.get(slLn, i))
+                array.push(oldLb,  array.get(slLb, i))
+                array.push(oldDay, dayId)
                 array.remove(slLn, i)
                 array.remove(slLb, i)
                 array.remove(slLvl, i)
