@@ -1,0 +1,362 @@
+//@version=6
+// ============================================================================
+//  FB / FBO — STADIO 1 · CONTESTO (Mancini)  v1.6 — flip temporale (acceptBars) + PDL/PDH disegnati
+// ----------------------------------------------------------------------------
+//  NOVITA' v1.5:
+//   · CAMBIO DI POLARITA' (macchina unificata a 6 stati): ogni livello, CSV o
+//     auto, e' supporto quando il prezzo sta sopra e resistenza quando sta
+//     sotto. Una resistenza rotta e ACCETTATA sopra (close > L + risoluzione)
+//     diventa supporto: difesa (◆ verde), Failed Breakdown e reclaim → ARM LONG.
+//     Flip verso l'alto veloce (distanza); verso il basso lento (solo timeout),
+//     per non uccidere i Deep FB (asimmetria strutturale SPX, pro-Mancini).
+//   · LIVELLI AUTOMATICI: pivot 15m con swing >= swingMin (20 pt) dal massimo/
+//     minimo precedente → livello "A" (linea puntinata), stessa macchina.
+//     Max autoMax per lato, dedup con livelli esistenti.
+//  Stati: 0 watch-sopra · 1 flush(long) · 2 ARM LONG · 3 watch-sotto ·
+//         4 break(short) · 5 ARM SELL
+//  NO REPAINT (barra chiusa) · STORICO PERSISTENTE · applicare sul 15m.
+// ============================================================================
+
+indicator("FB/FBO · Stadio 1 — Contesto (Mancini) v1.6", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+grpCSV = "① Livelli (CSV Mancini/Carolyn)"
+csvInput = input.text_area(defval = "S,7680,S1,2\nS,7645,S2,2\nS,7627,S3,2\nS,7612,S4,1\nR,7695,R1,2\nR,7720,R2,2\nR,7745,R3,2\nR,7758,R4,1", title = "LATO,PREZZO,ETICHETTA,RANGO", group = grpCSV)
+
+grpFB = "② Difesa / Flush / Reclaim"
+defenseRally  = input.float(15.0, "Difesa: distanza min dal livello (pt)", group=grpFB)
+flushMin      = input.float(3.0,  "Flush minimo (pt)", group=grpFB)
+dangerZone    = input.float(5.0,  "Danger-zone / soglia L±5 (pt)", group=grpFB)
+stopBuffer    = input.float(5.0,  "Buffer stop oltre il flush (pt)", group=grpFB)
+deepThreshold = input.float(20.0, "Soglia Deep FB (pt)", group=grpFB)
+maxFlushBars  = input.int(48,     "Durata max flush (barre)", group=grpFB)
+resolveMult   = input.float(3.0,  "Risoluzione/accettazione (× danger-zone)", group=grpFB, tooltip="Anche distanza di ACCETTAZIONE del breakout: oltre L + questo×dz la resistenza rotta diventa supporto.")
+touchTol      = input.float(3.0,  "Tolleranza tocco (shelf-score, pt)", group=grpFB)
+defFresh      = input.int(16,     "Freschezza difesa (barre, 0 = off)", group=grpFB, tooltip="La difesa vale solo se l'escursione oltre defenseRally e' avvenuta entro queste barre.")
+acceptBars    = input.int(16,     "Accettazione oltre il livello: chiusure consecutive per il flip di ruolo (0 = off)", group=grpFB, tooltip="Dopo N chiusure 15m consecutive oltre il livello perso/rotto, il ruolo flippa senza attendere maxFlushBars. Piu' basso = flip (e short da backtest) piu' rapidi, ma Deep FB lenti persi.")
+
+grpAU = "③ Livelli automatici (minimi/massimi significativi)"
+useAuto  = input.bool(true, "Attiva livelli automatici", group=grpAU)
+swingMin = input.float(20.0,"Swing minimo dal massimo/minimo precedente (pt)", group=grpAU)
+autoPl   = input.int(3, "Pivot: barre a sinistra", group=grpAU)
+autoPr   = input.int(3, "Pivot: barre a destra", group=grpAU)
+autoTol  = input.float(4.0, "Dedup: distanza min da livelli esistenti (pt)", group=grpAU)
+autoMax  = input.int(4, "Max livelli auto per lato", group=grpAU)
+
+grpSC = "④ Scoring"
+wLevel=input.float(20,"Peso livello base",group=grpSC), wPDL=input.float(25,"Peso PDL/PDH",group=grpSC)
+wDef=input.float(15,"Peso difesa",group=grpSC), wShelf=input.float(10,"Peso shelf",group=grpSC)
+wDeep=input.float(15,"Peso Deep",group=grpSC), wShallow=input.float(8,"Peso Shallow",group=grpSC)
+wRank=input.float(10,"Peso rango 2",group=grpSC), pdlTol=input.float(4.0,"Tolleranza PDL/PDH",group=grpSC)
+minScoreArm = input.int(0, "Score minimo per armare (0 = off)", group=grpSC)
+
+grpDIR = "⑤ Direzione"
+enableLong  = input.bool(true,  "Abilita LONG", group=grpDIR)
+enableShort = input.bool(true,  "Abilita SELL (laboratorio)", group=grpDIR)
+sellPenalty = input.float(0.85, "Penalizzazione score SELL", minval=0.1, maxval=1.0, group=grpDIR)
+
+grpGFX = "⑥ Grafica"
+showLevels      = input.bool(true, "Mostra linee livelli", group=grpGFX)
+showLevelLabels = input.bool(true, "Mostra etichette livelli", group=grpGFX)
+showDef         = input.bool(true, "Mostra ◆ difesa (verde=long, rosso=sell)", group=grpGFX)
+showPDLH        = input.bool(true, "Mostra PDL / PDH etichettati", group=grpGFX)
+showDanger      = input.bool(true, "Mostra danger-zone (box)", group=grpGFX)
+showArm         = input.bool(true, "Mostra etichette di armo", group=grpGFX)
+showTable       = input.bool(true, "Mostra tabella di stato", group=grpGFX)
+colSup = input.color(#1E6B33, "Colore supporti",   group=grpGFX)
+colRes = input.color(#9C1C1C, "Colore resistenze", group=grpGFX)
+
+pdl = request.security(syminfo.tickerid, "1D", low[1],  lookahead=barmerge.lookahead_off)
+pdh = request.security(syminfo.tickerid, "1D", high[1], lookahead=barmerge.lookahead_off)
+pvL = ta.pivotlow(autoPl, autoPr)
+pvH = ta.pivothigh(autoPl, autoPr)
+pvBar = bar_index - autoPr
+var float lastPH = na
+var float lastPL = na
+
+// ═══ arrays livelli ═══
+var array<float>  lp  = array.new_float()
+var array<string> ls  = array.new_string()
+var array<string> ll  = array.new_string()
+var array<int>    lr  = array.new_int()
+var array<bool>   lau = array.new_bool()     // auto?
+var array<int>    lbn = array.new_int()      // nascita (bar)
+var array<int>    lst = array.new_int()      // 0..5
+var array<float>  lfl = array.new_float()
+var array<int>    lfb = array.new_int()
+var array<float>  lde = array.new_float()
+var array<bool>   ldm = array.new_bool()
+var array<int>    ltc = array.new_int()
+var array<bool>   lnr = array.new_bool()
+var array<int>    ldt = array.new_int()      // ultimo step con escursione di difesa
+var array<int>    lcb = array.new_int()      // chiusure consecutive oltre il livello (flip temporale)
+var array<line>   lln = array.new_line()
+var array<label>  llb = array.new_label()
+
+addLevel(float pr, string sd, string lab, int rki, bool isAuto) =>
+    dup = false
+    if array.size(lp) > 0
+        for i = 0 to array.size(lp) - 1
+            if math.abs(array.get(lp, i) - pr) <= autoTol
+                dup := true
+    if not dup
+        array.push(lp, pr), array.push(ls, sd), array.push(ll, lab), array.push(lr, rki)
+        array.push(lau, isAuto), array.push(lbn, bar_index)
+        array.push(lst, close > pr ? 0 : 3)
+        array.push(lfl, na), array.push(lfb, 0)
+        array.push(lde, close > pr ? high : low), array.push(ldm, false)
+        array.push(ltc, 0), array.push(lnr, false)
+        array.push(ldt, -99999)
+        array.push(lcb, 0)
+        lc = sd == "S" ? colSup : colRes
+        array.push(lln, line.new(bar_index, pr, bar_index+1, pr, extend=extend.right, color = showLevels ? color.new(lc, isAuto ? 20 : 35) : na, width = rki==2?2:1, style = isAuto ? line.style_dotted : line.style_solid))
+        array.push(llb, label.new(bar_index, pr, "", style=label.style_none, textcolor=lc, size=size.small))
+    dup
+
+removeLevel(int idx) =>
+    line.delete(array.get(lln, idx))
+    label.delete(array.get(llb, idx))
+    array.remove(lp,idx), array.remove(ls,idx), array.remove(ll,idx), array.remove(lr,idx)
+    array.remove(lau,idx), array.remove(lbn,idx), array.remove(lst,idx), array.remove(lfl,idx)
+    array.remove(lfb,idx), array.remove(lde,idx), array.remove(ldm,idx), array.remove(ltc,idx)
+    array.remove(lnr,idx), array.remove(ldt,idx), array.remove(lcb,idx), array.remove(lln,idx), array.remove(llb,idx)
+
+capAuto(string sd) =>
+    n = 0
+    old = -1
+    float far = -1.0
+    if array.size(lp) > 0
+        for i = 0 to array.size(lp) - 1
+            if array.get(lau, i) and array.get(ls, i) == sd
+                n += 1
+                d = math.abs(close - array.get(lp, i))
+                if d > far
+                    far := d
+                    old := i
+    if n > autoMax and old >= 0
+        removeLevel(old)
+
+if barstate.isfirst
+    rows = str.split(csvInput, "\n")
+    for i = 0 to array.size(rows) - 1
+        clean = str.replace_all(str.replace_all(array.get(rows,i)," ",""),"\r","")
+        if str.length(clean) > 0
+            parts = str.split(clean, ",")
+            if array.size(parts) >= 4
+                pr = str.tonumber(array.get(parts,1))
+                if not na(pr)
+                    rk = str.tonumber(array.get(parts,3))
+                    addLevel(pr, array.get(parts,0), array.get(parts,2), na(rk)?1:int(rk), false)
+
+scoreL(int i, float L, float fl, float de, int rk, bool isShort) =>
+    depth = isShort ? fl - L : L - fl
+    dd = isShort ? (na(de)?0.0:(L-de)) : (na(de)?0.0:(de-L))
+    pgold = isShort ? (not na(pdh) and math.abs(L-pdh)<=pdlTol) : (not na(pdl) and math.abs(L-pdl)<=pdlTol)
+    sc = wLevel
+    sc += pgold ? wPDL : 0.0
+    sc += math.min(dd/(defenseRally*2.0),1.0)*wDef
+    sc += math.min(array.get(ltc,i),4)*wShelf
+    sc += depth >= deepThreshold ? wDeep : wShallow
+    sc += rk==2 ? wRank : 0.0
+    m = math.min(sc,100)
+    isShort ? m*sellPenalty : m
+
+drawArmL(int i, float L, float fl, float sc) =>
+    array.set(lst, i, 2), array.set(lfl, i, fl), array.set(lde, i, na), array.set(ldm, i, false)
+    if showArm
+        label.new(bar_index, low, "▲ARM " + str.tostring(int(math.round(sc))) + "  " + array.get(ll, i), yloc=yloc.belowbar, style=label.style_label_up, color=color.new(colSup,15), textcolor=color.white, size=size.small)
+    if showDanger
+        box.new(array.get(lfb,i), L+dangerZone, bar_index+10, L, border_color=color.new(color.orange,35), bgcolor=color.new(color.orange,85))
+    [L+dangerZone, fl-stopBuffer]
+
+drawArmS(int i, float L, float fh, float sc) =>
+    array.set(lst, i, 5), array.set(lfl, i, fh), array.set(lde, i, na), array.set(ldm, i, false)
+    if showArm
+        label.new(bar_index, high, "▼ARM " + str.tostring(int(math.round(sc))) + "  " + array.get(ll, i), yloc=yloc.abovebar, style=label.style_label_down, color=color.new(colRes,15), textcolor=color.white, size=size.small)
+    if showDanger
+        box.new(array.get(lfb,i), L, bar_index+10, L-dangerZone, border_color=color.new(color.orange,35), bgcolor=color.new(color.orange,85))
+    [L-dangerZone, fh+stopBuffer]
+
+var float  lastArmLevel  = na
+var string lastArmDir    = ""
+var float  lastArmScore  = na
+var float  lastArmThresh = na
+var float  lastArmStop   = na
+var int    lastArmBar    = na
+armLongSignal  = false
+armShortSignal = false
+
+// ═══════════════════  MOTORE (barra chiusa, 6 stati)  ═══════════════════════
+if barstate.isconfirmed
+    for i = 0 to array.size(lp) - 1
+        L  = array.get(lp,i)
+        rk = array.get(lr,i)
+        st = array.get(lst,i)
+        nn = low <= L + touchTol and high >= L - touchTol
+        if nn and not array.get(lnr,i)
+            array.set(ltc, i, array.get(ltc,i)+1)
+        array.set(lnr, i, nn)
+
+        if st == 0                                          // WATCH SOPRA (supporto)
+            de = na(array.get(lde,i)) ? high : math.max(array.get(lde,i), high)
+            array.set(lde,i,de)
+            if high - L >= defenseRally
+                array.set(ldt, i, bar_index)
+            defended = (de - L) >= defenseRally and (defFresh <= 0 or bar_index - array.get(ldt,i) <= defFresh)
+            if not defended
+                array.set(ldm,i,false)
+            if defended and not array.get(ldm,i) and showDef
+                array.set(ldm,i,true)
+                label.new(bar_index, L, "◆", yloc=yloc.price, style=label.style_label_up, color=color.new(colSup,70), textcolor=colSup, size=size.tiny)
+            if close[1] >= L and low < L
+                if defended and enableLong
+                    array.set(lst,i,1), array.set(lfl,i,low), array.set(lfb,i,bar_index), array.set(lcb,i,0)
+                    if close > L and (L - low) >= flushMin
+                        sc = scoreL(i, L, low, de, rk, false)
+                        if sc >= minScoreArm
+                            [thr, stp] = drawArmL(i, L, low, sc)
+                            lastArmLevel := L, lastArmDir := "LONG", lastArmScore := sc
+                            lastArmThresh := thr, lastArmStop := stp, lastArmBar := bar_index
+                            armLongSignal := true
+                        else
+                            array.set(lst,i,3), array.set(lde,i,low), array.set(ldm,i,false)
+                else
+                    array.set(lst,i,3), array.set(lde,i,low), array.set(ldm,i,false)
+            else if close < L and close[1] < L
+                array.set(lst,i,3), array.set(lde,i,low), array.set(ldm,i,false)
+        else if st == 1                                     // FLUSH (long)
+            fl = math.min(array.get(lfl,i), low)
+            array.set(lfl,i,fl)
+            array.set(lcb, i, close < L ? array.get(lcb,i) + 1 : 0)
+            if close > L and (L - fl) >= flushMin
+                sc = scoreL(i, L, fl, array.get(lde,i), rk, false)
+                if sc >= minScoreArm
+                    [thr, stp] = drawArmL(i, L, fl, sc)
+                    lastArmLevel := L, lastArmDir := "LONG", lastArmScore := sc
+                    lastArmThresh := thr, lastArmStop := stp, lastArmBar := bar_index
+                    armLongSignal := true
+                else
+                    array.set(lst,i,3), array.set(lde,i,low), array.set(ldm,i,false)
+            else if (acceptBars > 0 and array.get(lcb,i) >= acceptBars) or bar_index - array.get(lfb,i) > maxFlushBars
+                array.set(lst,i,3), array.set(lde,i,low), array.set(ldm,i,false)
+        else if st == 2                                     // ARM LONG
+            if low < array.get(lfl,i)
+                array.set(lst,i,3), array.set(lde,i,low), array.set(ldm,i,false)
+            else if close > L + resolveMult*dangerZone
+                array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+        else if st == 3                                     // WATCH SOTTO (resistenza)
+            de = na(array.get(lde,i)) ? low : math.min(array.get(lde,i), low)
+            array.set(lde,i,de)
+            if L - low >= defenseRally
+                array.set(ldt, i, bar_index)
+            defended = (L - de) >= defenseRally and (defFresh <= 0 or bar_index - array.get(ldt,i) <= defFresh)
+            if not defended
+                array.set(ldm,i,false)
+            if defended and not array.get(ldm,i) and showDef
+                array.set(ldm,i,true)
+                label.new(bar_index, L, "◆", yloc=yloc.price, style=label.style_label_down, color=color.new(colRes,70), textcolor=colRes, size=size.tiny)
+            if close[1] <= L and high > L
+                if defended and enableShort
+                    array.set(lst,i,4), array.set(lfl,i,high), array.set(lfb,i,bar_index), array.set(lcb,i,0)
+                    if close < L and (high - L) >= flushMin
+                        sc = scoreL(i, L, high, de, rk, true)
+                        if sc >= minScoreArm
+                            [thr, stp] = drawArmS(i, L, high, sc)
+                            lastArmLevel := L, lastArmDir := "SELL", lastArmScore := sc
+                            lastArmThresh := thr, lastArmStop := stp, lastArmBar := bar_index
+                            armShortSignal := true
+                        else
+                            array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+                else
+                    array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+            else if close > L and close[1] > L
+                array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+        else if st == 4                                     // BREAK (short)
+            fh = math.max(array.get(lfl,i), high)
+            array.set(lfl,i,fh)
+            array.set(lcb, i, close > L ? array.get(lcb,i) + 1 : 0)
+            if close < L and (fh - L) >= flushMin
+                sc = scoreL(i, L, fh, array.get(lde,i), rk, true)
+                if sc >= minScoreArm
+                    [thr, stp] = drawArmS(i, L, fh, sc)
+                    lastArmLevel := L, lastArmDir := "SELL", lastArmScore := sc
+                    lastArmThresh := thr, lastArmStop := stp, lastArmBar := bar_index
+                    armShortSignal := true
+                else
+                    array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+            else if close > L + resolveMult*dangerZone      // ACCETTAZIONE breakout → FLIP a supporto
+                array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+            else if (acceptBars > 0 and array.get(lcb,i) >= acceptBars) or bar_index - array.get(lfb,i) > maxFlushBars
+                array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+        else if st == 5                                     // ARM SELL
+            if high > array.get(lfl,i)
+                array.set(lst,i,0), array.set(lde,i,high), array.set(ldm,i,false)
+            else if close < L - resolveMult*dangerZone
+                array.set(lst,i,3), array.set(lde,i,low), array.set(ldm,i,false)
+
+    // ── livelli automatici (dopo il loop) ──
+    if useAuto
+        if not na(pvL)
+            swing = na(lastPH) ? na : lastPH - pvL
+            if not na(swing) and swing >= swingMin
+                if not addLevel(pvL, "S", "A", 1, true)
+                    capAuto("S")
+            lastPL := pvL
+        if not na(pvH)
+            swing2 = na(lastPL) ? na : pvH - lastPL
+            if not na(swing2) and swing2 >= swingMin
+                if not addLevel(pvH, "R", "A", 1, true)
+                    capAuto("R")
+            lastPH := pvH
+
+// ── PDL / PDH disegnati ed etichettati ──
+plot(showPDLH ? pdl : na, "PDL", color=color.new(#2962FF, 45), style=plot.style_linebr, linewidth=1)
+plot(showPDLH ? pdh : na, "PDH", color=color.new(#E53935, 45), style=plot.style_linebr, linewidth=1)
+var label pdlLbl = na
+var label pdhLbl = na
+if barstate.islast and showPDLH
+    if na(pdlLbl)
+        pdlLbl := label.new(bar_index, pdl, "", style=label.style_none, textcolor=color.new(#2962FF, 0), size=size.small)
+        pdhLbl := label.new(bar_index, pdh, "", style=label.style_none, textcolor=color.new(#E53935, 0), size=size.small)
+    label.set_xy(pdlLbl, bar_index + 9, pdl)
+    label.set_text(pdlLbl, "PDL " + str.tostring(pdl))
+    label.set_xy(pdhLbl, bar_index + 9, pdh)
+    label.set_text(pdhLbl, "PDH " + str.tostring(pdh))
+
+// etichette livelli (bordo destro) con prezzo
+if barstate.islast
+    for i = 0 to array.size(llb) - 1
+        lb = array.get(llb, i)
+        label.set_xy(lb, bar_index + 3, array.get(lp, i))
+        label.set_text(lb, showLevelLabels ? array.get(ll, i) + " " + str.tostring(array.get(lp, i)) : "")
+
+var table dash = na
+if showTable and barstate.islast
+    if na(dash)
+        dash := table.new(position.top_right, 2, 7, frame_color=color.gray, frame_width=1, border_color=color.new(color.gray,60), border_width=1)
+    nDefL = 0
+    nDefS = 0
+    nFl = 0
+    nAr = 0
+    for i = 0 to array.size(lst) - 1
+        s = array.get(lst, i)
+        nDefL += s == 0 and array.get(ldm,i) ? 1 : 0
+        nDefS += s == 3 and array.get(ldm,i) ? 1 : 0
+        nFl   += s == 1 or s == 4 ? 1 : 0
+        nAr   += s == 2 or s == 5 ? 1 : 0
+    table.cell(dash,0,0,"STADIO 1 · CONTESTO",bgcolor=#1F3864,text_color=color.white,text_size=size.small)
+    table.cell(dash,1,0,timeframe.period,bgcolor=#1F3864,text_color=color.white,text_size=size.small)
+    table.cell(dash,0,1,"Livelli (CSV+auto)",text_size=size.small)
+    table.cell(dash,1,1,str.tostring(array.size(lp)),text_size=size.small)
+    table.cell(dash,0,2,"Difesi ◆ long / sell",text_size=size.small)
+    table.cell(dash,1,2,str.tostring(nDefL) + " / " + str.tostring(nDefS),text_size=size.small)
+    table.cell(dash,0,3,"Flush/break in corso",text_size=size.small)
+    table.cell(dash,1,3,str.tostring(nFl),text_size=size.small)
+    table.cell(dash,0,4,"Armati",text_size=size.small)
+    table.cell(dash,1,4,str.tostring(nAr),text_size=size.small)
+    table.cell(dash,0,5,"Ultimo armo",text_size=size.small)
+    table.cell(dash,1,5, na(lastArmBar) ? "—" : lastArmDir + " @" + str.tostring(lastArmLevel), text_size=size.small, text_color = lastArmDir == "LONG" ? color.green : color.red)
+    table.cell(dash,0,6,"Score / soglia / stop",text_size=size.small)
+    table.cell(dash,1,6, na(lastArmScore) ? "—" : str.tostring(int(math.round(lastArmScore))) + " / " + str.tostring(lastArmThresh) + " / " + str.tostring(lastArmStop), text_size=size.small)
+
+alertcondition(armLongSignal,  title="FB LONG armato (15m)",  message="FB LONG armato — controlla il 1min per il trigger")
+alertcondition(armShortSignal, title="FBO SELL armato (15m)", message="FBO SELL armato — controlla il 1min per il trigger")
