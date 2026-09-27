@@ -1,0 +1,447 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  Candle Rejection – Hammer / Shooting Star / Long Legged Doji
+//  Pine Script v6  |  Pensato per timeframe 1–5 min su ES / MES
+//
+//  CONCETTI CHIAVE
+//  ───────────────────────────────────────────────────────────────────────────
+//  Il pattern candlestick NON è il segnale: è il trigger. Il segnale nasce
+//  solo se il pattern si forma nel contesto giusto. Ogni pattern riceve un
+//  PUNTEGGIO 0–4:
+//    +1 Location : l'ombra tocca/buca un livello (VWAP, bande VWAP, pivot)
+//                  e la candela chiude dal lato giusto del livello
+//    +1 Trend    : prezzo dal lato giusto dell'EMA del timeframe superiore
+//    +1 Volume   : volume > media × moltiplicatore
+//    +1 Size     : range candela ≥ N × ATR (niente candele-rumore)
+//  BUY/SELL viene stampato solo se punteggio ≥ soglia (e, opzionale,
+//  Location obbligatoria).
+//
+//  Hammer (long)        : ombra inferiore lunga, dopo una discesa
+//  Shooting Star (short): ombra superiore lunga, dopo una salita
+//  Long Legged Doji     : indecisione, NON direzionale → sempre in modalità
+//                         rottura: BUY sopra il massimo / SELL sotto il minimo
+//                         (ordini OCO: uno scatta, l'altro si cancella)
+//
+//  Modalità ingresso (Hammer / Star):
+//    "Chiusura pattern" : entry a mercato all'apertura della barra successiva
+//    "Rottura max/min"  : ordine stop oltre il max/min del pattern, valido
+//                         per N barre (conferma = rottura)
+//
+//  Stop: oltre l'ombra del pattern + N tick. Target: R multiplo del rischio.
+//  Time stop opzionale e chiusura a fine giornata.
+//  Segnali calcolati a barra chiusa → nessun repaint.
+// ════════════════════════════════════════════════════════════════════════════
+//@version=6
+strategy("Candle Rejection – Hammer / Star / LL Doji",
+         shorttitle              = "Candle Rejection",
+         overlay                 = true,
+         initial_capital         = 100000,
+         default_qty_type        = strategy.fixed,
+         default_qty_value       = 1,
+         commission_type         = strategy.commission.cash_per_contract,
+         commission_value        = 2.05,
+         slippage                = 1,
+         pyramiding              = 0,
+         process_orders_on_close = false,
+         calc_on_order_fills     = false,
+         max_lines_count         = 500,
+         max_labels_count        = 500)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  I N P U T S
+// ════════════════════════════════════════════════════════════════════════════
+
+var string G_PAT = "🕯️ Pattern"
+var string G_FLT = "🧮 Filtri & Punteggio"
+var string G_LVL = "📍 Livelli (VWAP & Pivot)"
+var string G_ENT = "🎯 Ingresso & Rischio"
+var string G_SS  = "🕐 Sessione"
+var string G_VIS = "🎨 Visuals"
+
+// ── Pattern ──────────────────────────────────────────────────────────────────
+i_useHam   = input.bool  (true, "Hammer (long)",          group=G_PAT, inline="p")
+i_useStar  = input.bool  (true, "Shooting Star (short)",  group=G_PAT, inline="p")
+i_useDoji  = input.bool  (true, "Long Legged Doji",       group=G_PAT, inline="p")
+i_wickBody = input.float (2.0,  "Hammer/Star: ombra ≥ N × corpo",
+             minval=1.0, step=0.1, group=G_PAT)
+i_wickRng  = input.float (0.55, "Hammer/Star: ombra ≥ frazione del range",
+             minval=0.3, maxval=0.95, step=0.05, group=G_PAT)
+i_oppWick  = input.float (0.25, "Hammer/Star: ombra opposta ≤ frazione del range",
+             minval=0.0, maxval=0.5, step=0.05, group=G_PAT)
+i_prevBars = input.int   (3,    "Movimento precedente (barre)",
+             minval=1, maxval=20, group=G_PAT,
+             tooltip="Hammer: close[1] < close[1+N] (arriva da una discesa). Shooting Star: il contrario.")
+i_dojiBody = input.float (0.10, "Doji: corpo ≤ frazione del range",
+             minval=0.01, maxval=0.3, step=0.01, group=G_PAT)
+i_dojiWick = input.float (0.30, "Doji: ciascuna ombra ≥ frazione del range",
+             minval=0.1, maxval=0.49, step=0.01, group=G_PAT)
+i_dojiAtr  = input.float (1.2,  "Doji: range ≥ N × ATR (gambe lunghe)",
+             minval=0.1, step=0.1, group=G_PAT)
+
+// ── Filtri & Punteggio ───────────────────────────────────────────────────────
+i_atrLen   = input.int   (14,   "ATR periodo",                     minval=1,   group=G_FLT)
+i_sizeAtr  = input.float (0.8,  "Size: range ≥ N × ATR",           minval=0.0, step=0.1, group=G_FLT)
+i_volLen   = input.int   (20,   "Volume: media periodo",           minval=1,   group=G_FLT)
+i_volMult  = input.float (1.2,  "Volume: ≥ media × N",             minval=0.0, step=0.1, group=G_FLT)
+i_htf      = input.timeframe("15", "Trend: timeframe superiore",   group=G_FLT)
+i_htfLen   = input.int   (20,   "Trend: EMA periodo (HTF)",        minval=1,   group=G_FLT)
+i_minScore = input.int   (3,    "Punteggio minimo (0–4)",          minval=0, maxval=4, group=G_FLT,
+             tooltip="0 = nessun filtro (tutti i pattern). Utile nello Strategy Tester per misurare se i filtri aggiungono valore.")
+i_locReq   = input.bool  (true, "Location obbligatoria",           group=G_FLT,
+             tooltip="Se attivo, il pattern deve formarsi su un livello anche se il punteggio è sufficiente.")
+
+// ── Livelli ──────────────────────────────────────────────────────────────────
+i_useVwap   = input.bool  (true,  "Usa VWAP e bande",               group=G_LVL)
+i_vwAnchor  = input.string("RTH", "Ancoraggio VWAP",
+              options=["RTH", "Giornata (Globex)"],                  group=G_LVL)
+i_vwMult    = input.float (2.0,   "Bande VWAP: deviazioni standard", minval=0.1, step=0.1, group=G_LVL)
+i_usePiv    = input.bool  (true,  "Usa pivot (massimi/minimi)",     group=G_LVL)
+i_pivL      = input.int   (5,     "Pivot: barre sinistra",          minval=1, maxval=50, group=G_LVL)
+i_pivR      = input.int   (3,     "Pivot: barre destra (conferma)", minval=1, maxval=50, group=G_LVL)
+i_maxLvls   = input.int   (6,     "Pivot: numero massimo livelli",  minval=1, maxval=30, group=G_LVL)
+i_gapAtr    = input.float (0.5,   "Pivot: distanza minima (× ATR)", minval=0.0, step=0.1, group=G_LVL,
+              tooltip="Evita livelli duplicati troppo vicini.")
+i_tolAtr    = input.float (0.25,  "Tolleranza tocco livello (× ATR)", minval=0.0, step=0.05, group=G_LVL,
+              tooltip="Quanto vicino al livello deve arrivare l'ombra per contare come tocco.")
+
+// ── Ingresso & Rischio ───────────────────────────────────────────────────────
+i_entryMode = input.string("Rottura max/min", "Modalità ingresso (Hammer/Star)",
+              options=["Chiusura pattern", "Rottura max/min"], group=G_ENT,
+              tooltip="Il Long Legged Doji usa sempre la rottura, perché non è direzionale.")
+i_pendBars  = input.int   (3,   "Rottura: validità ordine (barre)", minval=1, maxval=20, group=G_ENT)
+i_slTicks   = input.int   (2,   "Tick oltre l'ombra (stop)",        minval=0, group=G_ENT)
+i_rr        = input.float (1.5, "Risk / Reward",                    minval=0.1, step=0.1, group=G_ENT)
+i_timeBars  = input.int   (10,  "Time stop (barre, 0 = off)",       minval=0, group=G_ENT,
+              tooltip="Chiude il trade se dopo N barre non è in profitto.")
+
+// ── Sessione ─────────────────────────────────────────────────────────────────
+i_useSession = input.bool   (true,               "Filtra nuovi ingressi per sessione", group=G_SS)
+i_session    = input.session("0935-1545",        "Finestra ingressi",                  group=G_SS)
+i_skipLunch  = input.bool   (false,              "Escludi pausa pranzo",               group=G_SS)
+i_lunch      = input.session("1130-1330",        "Pausa pranzo",                       group=G_SS)
+i_useEod     = input.bool   (true,               "Chiudi tutto a fine giornata",       group=G_SS)
+i_eodH       = input.int    (15,                 "Chiusura: ora",   minval=0, maxval=23, group=G_SS, inline="eod")
+i_eodM       = input.int    (55,                 "minuto",          minval=0, maxval=59, group=G_SS, inline="eod")
+i_tz         = input.string ("America/New_York", "Fuso orario",                        group=G_SS)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+i_showRaw   = input.bool  (true,  "Mostra pattern grezzi (pallini)",  group=G_VIS)
+i_showLvls  = input.bool  (true,  "Mostra livelli pivot",             group=G_VIS)
+i_showVwap  = input.bool  (true,  "Mostra VWAP e bande",              group=G_VIS)
+i_showTable = input.bool  (true,  "Mostra pannello statistiche",      group=G_VIS)
+i_colBuy    = input.color (color.new(#00C853, 0),  "Colore BUY",      group=G_VIS)
+i_colSell   = input.color (color.new(#D50000, 0),  "Colore SELL",     group=G_VIS)
+i_colSup    = input.color (color.new(#2962FF, 30), "Colore pivot minimi",  group=G_VIS)
+i_colRes    = input.color (color.new(#FF6D00, 30), "Colore pivot massimi", group=G_VIS)
+i_colVwap   = input.color (color.new(#AB47BC, 0),  "Colore VWAP",     group=G_VIS)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  G E O M E T R I A   C A N D E L A
+// ════════════════════════════════════════════════════════════════════════════
+float tick = syminfo.mintick
+float atr  = ta.atr(i_atrLen)
+float rng  = high - low
+float body = math.abs(close - open)
+float upW  = high - math.max(open, close)
+float loW  = math.min(open, close) - low
+
+bool downBefore = close[1] < close[1 + i_prevBars]
+bool upBefore   = close[1] > close[1 + i_prevBars]
+
+bool isHammer = i_useHam and rng > 0 and downBefore
+     and loW >= i_wickBody * body and loW >= i_wickRng * rng and upW <= i_oppWick * rng
+bool isStar   = i_useStar and rng > 0 and upBefore
+     and upW >= i_wickBody * body and upW >= i_wickRng * rng and loW <= i_oppWick * rng
+bool isDoji   = i_useDoji and rng > 0 and rng >= i_dojiAtr * atr
+     and body <= i_dojiBody * rng and upW >= i_dojiWick * rng and loW >= i_dojiWick * rng
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S E S S I O N E
+// ════════════════════════════════════════════════════════════════════════════
+bool inSession = not i_useSession or not na(time(timeframe.period, i_session, i_tz))
+bool inLunch   = i_skipLunch and not na(time(timeframe.period, i_lunch, i_tz))
+int  eodTs     = timestamp(i_tz, year(time, i_tz), month(time, i_tz), dayofmonth(time, i_tz), i_eodH, i_eodM)
+bool isEod     = i_useEod and time_close >= eodTs
+bool canTrade  = inSession and not inLunch and not isEod
+
+// ════════════════════════════════════════════════════════════════════════════
+//  V W A P
+// ════════════════════════════════════════════════════════════════════════════
+bool rthNow   = not na(time(timeframe.period, "0930-1600", i_tz))
+bool rthStart = rthNow and not rthNow[1]
+bool vwAnchor = i_vwAnchor == "RTH" ? rthStart : timeframe.change("1D")
+[vw, vwUp, vwDn] = ta.vwap(hlc3, vwAnchor, i_vwMult)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  P I V O T   ( S U P P O R T I  /  R E S I S T E N Z E )
+// ════════════════════════════════════════════════════════════════════════════
+float pH = ta.pivothigh(high, i_pivL, i_pivR)
+float pL = ta.pivotlow (low,  i_pivL, i_pivR)
+
+var array<float> lvls     = array.new<float>(0)
+var array<line>  lvlLines = array.new<line> (0)
+
+f_addLevel(float lvl, color col) =>
+    bool dup = false
+    if array.size(lvls) > 0
+        for i = 0 to array.size(lvls) - 1
+            if math.abs(array.get(lvls, i) - lvl) < i_gapAtr * atr
+                dup := true
+                break
+    if not dup
+        array.unshift(lvls, lvl)
+        line ln = i_showLvls ? line.new(bar_index - i_pivR, lvl, bar_index, lvl,
+             xloc=xloc.bar_index, color=col, style=line.style_dashed, width=1) : na
+        array.unshift(lvlLines, ln)
+        while array.size(lvls) > i_maxLvls
+            array.pop(lvls)
+            line.delete(array.pop(lvlLines))
+
+if i_usePiv
+    if not na(pH)
+        f_addLevel(pH, i_colRes)
+    if not na(pL)
+        f_addLevel(pL, i_colSup)
+
+if i_showLvls and array.size(lvlLines) > 0
+    for i = 0 to array.size(lvlLines) - 1
+        line ln = array.get(lvlLines, i)
+        if not na(ln)
+            line.set_x2(ln, bar_index)
+
+// Supporto: l'ombra inferiore arriva al livello (± tolleranza) e la candela
+// chiude sopra → rifiuto rialzista. Resistenza: specchio.
+f_supportTouch(float lo, float cl, float tol) =>
+    bool hit = false
+    if i_useVwap
+        hit := (lo <= vw + tol and cl >= vw) or (lo <= vwDn + tol and cl >= vwDn)
+    if not hit and i_usePiv and array.size(lvls) > 0
+        for i = 0 to array.size(lvls) - 1
+            float l = array.get(lvls, i)
+            if lo <= l + tol and cl >= l
+                hit := true
+                break
+    hit
+
+f_resistTouch(float hi, float cl, float tol) =>
+    bool hit = false
+    if i_useVwap
+        hit := (hi >= vw - tol and cl <= vw) or (hi >= vwUp - tol and cl <= vwUp)
+    if not hit and i_usePiv and array.size(lvls) > 0
+        for i = 0 to array.size(lvls) - 1
+            float l = array.get(lvls, i)
+            if hi >= l - tol and cl <= l
+                hit := true
+                break
+    hit
+
+// ════════════════════════════════════════════════════════════════════════════
+//  F I L T R I   &   P U N T E G G I O
+// ════════════════════════════════════════════════════════════════════════════
+float touchTol = i_tolAtr * atr
+bool  volOk  = volume > ta.sma(volume, i_volLen) * i_volMult
+bool  sizeOk = rng >= i_sizeAtr * atr
+
+// EMA HTF dell'ultima barra HTF chiusa → nessun repaint
+float htfEma = request.security(syminfo.tickerid, i_htf, ta.ema(close, i_htfLen)[1],
+                                lookahead=barmerge.lookahead_on)
+bool trendL = close > htfEma
+bool trendS = close < htfEma
+
+bool locL = f_supportTouch(low,  close, touchTol)
+bool locS = f_resistTouch (high, close, touchTol)
+
+int scoreL = (locL ? 1 : 0) + (trendL ? 1 : 0) + (volOk ? 1 : 0) + (sizeOk ? 1 : 0)
+int scoreS = (locS ? 1 : 0) + (trendS ? 1 : 0) + (volOk ? 1 : 0) + (sizeOk ? 1 : 0)
+
+bool passL = scoreL >= i_minScore and (not i_locReq or locL)
+bool passS = scoreS >= i_minScore and (not i_locReq or locS)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  E T I C H E T T E   &   A L E R T
+// ════════════════════════════════════════════════════════════════════════════
+f_signal(bool isLong, string txt) =>
+    string msg = (isLong ? "BUY " : "SELL ") + txt
+    label.new(bar_index, isLong ? low : high, (isLong ? "BUY\n" : "SELL\n") + txt,
+         xloc=xloc.bar_index, yloc=isLong ? yloc.belowbar : yloc.abovebar,
+         style=isLong ? label.style_label_up : label.style_label_down,
+         color=isLong ? i_colBuy : i_colSell, textcolor=color.white, size=size.small)
+    alert(syminfo.ticker + " " + timeframe.period + "m – " + msg, alert.freq_once_per_bar_close)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  S T A T O
+// ════════════════════════════════════════════════════════════════════════════
+var bool   pendL    = false
+var float  slLPend  = na
+var int    pendLBar = na
+var string pendLTxt = ""
+
+var bool   pendS    = false
+var float  slSPend  = na
+var int    pendSBar = na
+var string pendSTxt = ""
+
+var float  curSL    = na
+var float  curTP    = na
+
+var int    rawCount = 0
+var int    sigCount = 0
+
+// ════════════════════════════════════════════════════════════════════════════
+//  1 )  G E S T I O N E   P O S I Z I O N E
+// ════════════════════════════════════════════════════════════════════════════
+if strategy.position_size > 0
+    if pendL                                    // ordine stop appena eseguito
+        f_signal(true, pendLTxt)
+        curSL := slLPend
+        pendL := false
+    if pendS                                    // lato opposto (OCO) annullato
+        strategy.cancel("S")
+        pendS := false
+    float riskL = strategy.position_avg_price - curSL
+    if riskL > 0
+        curTP := strategy.position_avg_price + i_rr * riskL
+        strategy.exit("L-X", from_entry="L", stop=curSL, limit=curTP)
+
+else if strategy.position_size < 0
+    if pendS
+        f_signal(false, pendSTxt)
+        curSL := slSPend
+        pendS := false
+    if pendL
+        strategy.cancel("L")
+        pendL := false
+    float riskS = curSL - strategy.position_avg_price
+    if riskS > 0
+        curTP := strategy.position_avg_price - i_rr * riskS
+        strategy.exit("S-X", from_entry="S", stop=curSL, limit=curTP)
+
+else
+    curSL := na
+    curTP := na
+
+// Time stop: fuori se dopo N barre il trade non è in profitto
+if i_timeBars > 0 and strategy.opentrades > 0
+    if bar_index - strategy.opentrades.entry_bar_index(0) >= i_timeBars
+         and strategy.opentrades.profit(0) <= 0
+        strategy.close_all(comment="Time stop")
+
+// Fine giornata: chiude posizione e annulla ordini pendenti
+if isEod and strategy.position_size != 0
+    strategy.close_all(comment="EOD", immediately=true)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  2 )  S C A D E N Z A   /   I N V A L I D A Z I O N E   O R D I N I
+// ════════════════════════════════════════════════════════════════════════════
+if pendL and strategy.position_size == 0
+    if bar_index - pendLBar >= i_pendBars or close < slLPend or not canTrade
+        strategy.cancel("L")
+        pendL := false
+
+if pendS and strategy.position_size == 0
+    if bar_index - pendSBar >= i_pendBars or close > slSPend or not canTrade
+        strategy.cancel("S")
+        pendS := false
+
+// ════════════════════════════════════════════════════════════════════════════
+//  3 )  N U O V I   S E T U P
+// ════════════════════════════════════════════════════════════════════════════
+bool breakMode = i_entryMode == "Rottura max/min"
+bool anyRaw    = isHammer or isStar or isDoji
+bool anyPass   = (isHammer and passL) or (isStar and passS) or (isDoji and (passL or passS))
+
+if canTrade and barstate.isconfirmed
+    if anyRaw
+        rawCount += 1
+    if anyPass
+        sigCount += 1
+
+bool setupL = false
+bool setupS = false
+
+if canTrade and barstate.isconfirmed and strategy.position_size == 0 and not pendL and not pendS
+    bool   goL  = false
+    bool   goS  = false
+    string name = ""
+    if isHammer and passL
+        goL  := true
+        name := "Hammer"
+    else if isStar and passS
+        goS  := true
+        name := "Shooting Star"
+    else if isDoji
+        goL  := passL
+        goS  := passS
+        name := "LL Doji"
+
+    bool useStop = breakMode or isDoji
+    float slL = low  - i_slTicks * tick
+    float slS = high + i_slTicks * tick
+
+    if goL
+        string txt = name + " · " + str.tostring(scoreL) + "/4"
+        if useStop
+            float trig = high + tick
+            strategy.entry("L", strategy.long, stop=trig, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+            strategy.exit("L-X", from_entry="L", stop=slL, limit=trig + i_rr * (trig - slL))
+            pendL    := true
+            slLPend  := slL
+            pendLBar := bar_index
+            pendLTxt := txt
+            setupL   := true
+        else
+            strategy.entry("L", strategy.long)
+            strategy.exit("L-X", from_entry="L", stop=slL, limit=close + i_rr * (close - slL))
+            curSL := slL
+            f_signal(true, txt)
+
+    if goS
+        string txt = name + " · " + str.tostring(scoreS) + "/4"
+        if useStop
+            float trig = low - tick
+            strategy.entry("S", strategy.short, stop=trig, oca_name="ENTRY", oca_type=strategy.oca.cancel)
+            strategy.exit("S-X", from_entry="S", stop=slS, limit=trig - i_rr * (slS - trig))
+            pendS    := true
+            slSPend  := slS
+            pendSBar := bar_index
+            pendSTxt := txt
+            setupS   := true
+        else
+            strategy.entry("S", strategy.short)
+            strategy.exit("S-X", from_entry="S", stop=slS, limit=close - i_rr * (slS - close))
+            curSL := slS
+            f_signal(false, txt)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  P L O T
+// ════════════════════════════════════════════════════════════════════════════
+plot(i_showVwap ? vw   : na, "VWAP",        color=i_colVwap, linewidth=2)
+plot(i_showVwap ? vwUp : na, "VWAP +σ",     color=color.new(i_colVwap, 55))
+plot(i_showVwap ? vwDn : na, "VWAP −σ",     color=color.new(i_colVwap, 55))
+
+plot(strategy.position_size != 0 ? curSL : na, "Stop",   color=color.red,  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? curTP : na, "Target", color=color.lime, style=plot.style_linebr, linewidth=2)
+
+// Pattern grezzi (senza filtri): mostrano quanto rumore scarta il punteggio
+plotshape(i_showRaw and isHammer, "Hammer grezzo",        shape.circle,  location.belowbar, color.new(#00C853, 50), size=size.tiny)
+plotshape(i_showRaw and isStar,   "Shooting Star grezza", shape.circle,  location.abovebar, color.new(#D50000, 50), size=size.tiny)
+plotshape(i_showRaw and isDoji,   "LL Doji grezzo",       shape.diamond, location.abovebar, color.new(color.gray, 30), size=size.tiny)
+
+// Setup in attesa di rottura
+plotshape(setupL, "Setup long",  shape.triangleup,   location.belowbar, color.new(#00C853, 20), size=size.tiny)
+plotshape(setupS, "Setup short", shape.triangledown, location.abovebar, color.new(#D50000, 20), size=size.tiny)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  P A N N E L L O
+// ════════════════════════════════════════════════════════════════════════════
+var table tbl = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 25), border_width=1)
+
+if i_showTable and barstate.islast
+    float pct = rawCount > 0 ? 100.0 * sigCount / rawCount : 0.0
+    table.cell(tbl, 0, 0, "Pattern grezzi",   text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, str.tostring(rawCount),                    text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 1, "Superano filtro",  text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(sigCount) + "  (" + str.tostring(pct, "#.#") + "%)", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 2, "Soglia punteggio", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(i_minScore) + "/4" + (i_locReq ? " + Loc" : ""), text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 3, "Ingresso",         text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, i_entryMode,        text_color=color.white, text_size=size.small)
