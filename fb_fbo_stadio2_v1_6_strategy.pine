@@ -1,0 +1,913 @@
+//@version=6
+// ============================================================================
+//  FB / FBO — STADIO 2 · STRATEGY 1min  (v1.6) — backtest con uscite parziali
+//  Stessa logica di fb_fbo_stadio2_v1_6.pine (indicatore) + esecuzione ordini.
+// ----------------------------------------------------------------------------
+//  GESTIONE POSIZIONE (gruppo ⑩)
+//   · Ingresso a mercato sull'apertura della barra dopo il segnale (FB o BNC).
+//   · Uscite parziali, tutte con lo stesso stop iniziale:
+//       Lock (+4 pt)  → 50%   ·   T1 (livello successivo) → 25%
+//       T2 (livello dopo T1) → 25% (resto)
+//     Con 4 contratti: 2 / 1 / 1. Con meno di 4 contratti la divisione non
+//     è possibile (le quote arrotondate a 0 finiscono su T2).
+//   · Opzione: dopo il Lock, stop a pareggio sui contratti rimasti.
+//   · Chiusura forzata nella finestra di fine giornata.
+//   · Tabella statistiche: esito per POSIZIONE (somma delle parziali),
+//     con / senza candela di rifiuto e FB vs BNC.
+//  Consiglio: grafico MES1! a 1 minuto, 4 contratti. Commissioni in
+//  Proprietà (default 0.62 $/contratto per lato = MES; ES ≈ 2.05).
+// ----------------------------------------------------------------------------
+//  (v1.6 indicatore) conferma candlestick (Candle Rejection)
+//  Mancini (non-acceptance) × Carolyn (8/34 EMA + BNC) — grilletto d'ingresso
+// ----------------------------------------------------------------------------
+//  NOVITA' v1.6:
+//   · CONFERMA CANDLESTICK (gruppo ⑨): cerca nelle ultime N barre 1m una
+//     candela di rifiuto SUL livello del segnale (armato FB o BNC):
+//       long  → Hammer (o LL Doji) con ombra fino a L + tolleranza e close >= L
+//       sell  → Shooting Star (o LL Doji) con ombra fino a L − tol. e close <= L
+//     Modalita': Off (= v1.5) · Etichetta (segnali invariati, la label dice
+//     se c'era la candela) · Obbligatoria (niente candela → niente ingresso;
+//     il ciclo resta aperto e scatta appena la candela compare nella finestra).
+//   · Pallini sulle candele di rifiuto che toccano un livello (CSV o auto).
+//   · Alert dedicati "LONG/SELL + candela".
+//  Logica del motore 15m, trigger, BNC e target: invariata rispetto a v1.5.
+// ----------------------------------------------------------------------------
+//  NOVITA' v1.4 (allineato a Stadio 1 v1.5):
+//   · CAMBIO DI POLARITA': macchina unificata a 6 stati per ogni livello.
+//     Resistenza rotta e accettata sopra → supporto (FB long, BNC long, ◆).
+//     Flip su veloce (distanza), flip giu' lento (timeout) — pro Deep FB.
+//   · LIVELLI AUTOMATICI: pivot 15m con swing >= swingMin → livello "A"
+//     (linea puntinata), stessa macchina, stesso trigger, stesso BNC.
+//  Stati: 0 watch-sopra · 1 flush(long) · 2 ARM LONG · 3 watch-sotto ·
+//         4 break(short) · 5 ARM SELL
+//  Applicare sul grafico 1 MINUTO. Stadio 1 (v1.5) sul 15m per il contesto.
+//  NO REPAINT · STORICO PERSISTENTE · Lock +4pt · cicli di trigger · BNC.
+// ============================================================================
+
+strategy("FB/FBO · Stadio 2 — Strategy 1min (Mancini × Carolyn) v1.6", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=200,
+     initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=4,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.62,
+     slippage=1, pyramiding=0, margin_long=0, margin_short=0,
+     process_orders_on_close=false, calc_on_order_fills=false)
+
+grpCSV = "① Livelli (CSV, come Stadio 1)"
+csvInput = input.text_area(defval = "S,7680,S1,2\nS,7645,S2,2\nS,7627,S3,2\nS,7612,S4,1\nR,7695,R1,2\nR,7720,R2,2\nR,7745,R3,2\nR,7758,R4,1", title = "LATO,PREZZO,ETICHETTA,RANGO", group = grpCSV)
+
+grpENG = "② Motore 15m (Stadio 1)"
+htfTF         = input.timeframe("15", "Timeframe contesto", group=grpENG)
+defenseRally  = input.float(15.0, "Difesa: distanza min dal livello (pt)", group=grpENG)
+flushMin      = input.float(3.0,  "Flush minimo (pt)", group=grpENG)
+dangerZone    = input.float(5.0,  "Danger-zone / soglia L±5 (pt)", group=grpENG)
+stopBuffer    = input.float(5.0,  "Buffer stop oltre il flush (pt)", group=grpENG)
+deepThreshold = input.float(20.0, "Soglia Deep FB (pt)", group=grpENG)
+maxFlushBars  = input.int(48,     "Durata max flush (barre 15m)", group=grpENG)
+resolveMult   = input.float(3.0,  "Risoluzione/accettazione (× danger-zone)", group=grpENG)
+armTimeout    = input.int(0,      "Durata max armo (barre 15m, 0 = off)", group=grpENG)
+acceptBars    = input.int(16,     "Accettazione oltre il livello: chiusure 15m consecutive per il flip di ruolo (0 = off)", group=grpENG)
+touchTol      = input.float(3.0,  "Tolleranza tocco (shelf-score, pt)", group=grpENG)
+defFresh      = input.int(16,     "Freschezza difesa (barre 15m, 0 = off)", group=grpENG, tooltip="La difesa vale solo se l'escursione oltre defenseRally e' avvenuta entro queste barre.")
+
+grpAU = "③ Livelli automatici (minimi/massimi significativi)"
+useAuto  = input.bool(true, "Attiva livelli automatici", group=grpAU)
+swingMin = input.float(20.0,"Swing minimo dal massimo/minimo precedente (pt)", group=grpAU)
+autoPl   = input.int(3, "Pivot 15m: barre a sinistra", group=grpAU)
+autoPr   = input.int(3, "Pivot 15m: barre a destra", group=grpAU)
+autoTol  = input.float(4.0, "Dedup: distanza min da livelli esistenti (pt)", group=grpAU)
+autoMax  = input.int(4, "Max livelli auto per lato", group=grpAU)
+
+grpSC = "④ Scoring"
+wLevel=input.float(20,"Peso livello base",group=grpSC), wPDL=input.float(25,"Peso PDL/PDH",group=grpSC)
+wDef=input.float(15,"Peso difesa",group=grpSC), wShelf=input.float(10,"Peso shelf",group=grpSC)
+wDeep=input.float(15,"Peso Deep",group=grpSC), wShallow=input.float(8,"Peso Shallow",group=grpSC)
+wRank=input.float(10,"Peso rango 2",group=grpSC), pdlTol=input.float(4.0,"Tolleranza PDL/PDH",group=grpSC)
+sellPenalty=input.float(0.85,"Penalizzazione SELL",group=grpSC)
+
+grpT = "⑤ Trigger 1min (FB)"
+trigMode  = input.string("Gerarchico", "Modalita' trigger FB", options=["Gerarchico","Solo Non-Acceptance","Solo EMA","Entrambi (AND)"], group=grpT)
+holdBars  = input.int(2, "Non-acceptance: barre 1m di tenuta", minval=1, group=grpT)
+maxChase  = input.float(15.0, "Anti-inseguimento (pt, 0=off)", group=grpT)
+lockPts   = input.float(4.0, "Primo lock dall'ingresso (pt)", group=grpT)
+minTgtDist= input.float(6.0, "Distanza minima dei target dall'ingresso (pt)", group=grpT, tooltip="T1/T2 saltano i livelli troppo vicini all'ingresso (mappa fitta con i livelli AUTO).")
+emaFast   = input.int(8,  "EMA veloce (Carolyn)", group=grpT)
+emaSlow   = input.int(34, "EMA lenta (Carolyn)", group=grpT)
+pivL1     = input.int(3, "Pivot 1m sinistra (swing break)", group=grpT)
+pivR1     = input.int(2, "Pivot 1m destra (swing break)", group=grpT)
+enableLong  = input.bool(true,  "Abilita LONG", group=grpT)
+enableShort = input.bool(true,  "Abilita SELL (laboratorio)", group=grpT)
+
+grpB = "⑥ BNC — Tocco difeso (classe B)"
+useBNC     = input.bool(true, "Attiva segnali BNC", group=grpB)
+bncMode    = input.string("Tocco + anticipo flush", "Modalita' episodio", options=["Solo tocco (livello in watch)","Tocco + anticipo flush"], group=grpB)
+bncZone    = input.float(8.0,  "Zona di battaglia attorno al livello (pt)", group=grpB)
+bncRearm   = input.float(10.0, "Chiusura episodio: allontanamento (pt)", group=grpB)
+bncStopBuf = input.float(3.0,  "Buffer stop oltre l'estremo episodio (pt)", group=grpB)
+bncFactor  = input.float(0.85, "Fattore score BNC", minval=0.1, maxval=1.0, group=grpB)
+
+grpNQ = "⑦ Filtro NQ"
+useNQ    = input.bool(false, "Attiva filtro NQ", group=grpNQ)
+nqSym    = input.symbol("CME_MINI:NQ1!", "Simbolo NQ", group=grpNQ)
+nqFloor  = input.float(29180, "NQ floor (long)", group=grpNQ)
+nqCap    = input.float(29250, "NQ cap (short)", group=grpNQ)
+
+grpCD = "⑨ Conferma candlestick (Candle Rejection)"
+candMode   = input.string("Etichetta", "Filtro candela", options=["Off","Etichetta","Obbligatoria"], group=grpCD, tooltip="Off = comportamento v1.5. Etichetta = segnali invariati, la label indica la candela trovata. Obbligatoria = l'ingresso richiede la candela di rifiuto sul livello.")
+candLook   = input.int(15,    "Finestra di ricerca (barre 1m)", minval=1, maxval=60, group=grpCD, tooltip="15 = l'ultima barra 15m: include la candela di reclaim che ha armato il livello.")
+candTol    = input.float(5.0, "Ombra entro L ± (pt)", minval=0.0, group=grpCD, tooltip="L'ombra deve arrivare almeno a L + tol (long) / L − tol (sell). Default = danger-zone.")
+useDojiC   = input.bool(true, "Il Long Legged Doji vale come conferma", group=grpCD)
+cWickBody  = input.float(2.0,  "Hammer/Star: ombra ≥ N × corpo", minval=1.0, step=0.1, group=grpCD)
+cWickRng   = input.float(0.55, "Hammer/Star: ombra ≥ frazione del range", minval=0.3, maxval=0.95, step=0.05, group=grpCD)
+cOppWick   = input.float(0.25, "Hammer/Star: ombra opposta ≤ frazione del range", minval=0.0, maxval=0.5, step=0.05, group=grpCD)
+cDojiBody  = input.float(0.10, "Doji: corpo ≤ frazione del range", minval=0.01, maxval=0.3, step=0.01, group=grpCD)
+cDojiWick  = input.float(0.30, "Doji: ciascuna ombra ≥ frazione del range", minval=0.1, maxval=0.49, step=0.01, group=grpCD)
+cSizeAtr   = input.float(0.8,  "Size: range ≥ N × ATR(14) 1m (0 = off)", minval=0.0, step=0.1, group=grpCD)
+cVolMult   = input.float(0.0,  "Volume: ≥ media(20) × N (0 = off)", minval=0.0, step=0.1, group=grpCD)
+showCand   = input.bool(true,  "Mostra candele di rifiuto sui livelli", group=grpCD)
+
+grpST = "⑩ Strategy — gestione posizione"
+qtyTot     = input.int(4,      "Contratti totali per trade", minval=1, group=grpST, tooltip="4 = divisione esatta 50/25/25 (2 al Lock, 1 a T1, 1 a T2).")
+pctLock    = input.float(50.0, "% al Lock", minval=0, maxval=100, step=5, group=grpST)
+pctT1      = input.float(25.0, "% a T1 (il resto va a T2)", minval=0, maxval=100, step=5, group=grpST)
+beAfterLock= input.bool(false, "Dopo il Lock: stop a pareggio sul resto", group=grpST)
+t1FallR    = input.float(2.0,  "T1 di riserva se nessun livello (× rischio)", minval=0.5, step=0.5, group=grpST)
+tradeFB    = input.bool(true,  "Opera segnali FB / FBO", group=grpST)
+tradeBNC   = input.bool(true,  "Opera segnali BNC", group=grpST)
+useEntrySess = input.bool(false, "Limita ingressi a una finestra oraria", group=grpST)
+entrySess  = input.session("0930-1545", "Finestra ingressi", group=grpST)
+useEod     = input.bool(true,  "Chiusura forzata fine giornata", group=grpST)
+eodSess    = input.session("1555-1800", "Finestra chiusura (niente nuovi ingressi)", group=grpST)
+sessTz     = input.string("America/New_York", "Fuso orario sessioni", group=grpST)
+showStats  = input.bool(true,  "Mostra tabella statistiche", group=grpST)
+
+grpGFX = "⑧ Grafica"
+showLevels      = input.bool(true, "Mostra linee livelli", group=grpGFX)
+showLevelLabels = input.bool(true, "Mostra etichette livelli con PREZZO", group=grpGFX)
+showEMA    = input.bool(true, "Mostra EMA 8/34", group=grpGFX)
+showArmLvl = input.bool(true, "Mostra livello armato + soglia", group=grpGFX)
+showPDLH   = input.bool(true, "Mostra PDL / PDH etichettati", group=grpGFX)
+showEntry  = input.bool(true, "Mostra frecce/etichette d'ingresso", group=grpGFX)
+showTable  = input.bool(true, "Mostra tabella di stato", group=grpGFX)
+colSup=input.color(#1E6B33,"Colore long FB",group=grpGFX), colRes=input.color(#9C1C1C,"Colore short FB",group=grpGFX)
+colBncL=input.color(#00695C,"Colore BNC long",group=grpGFX), colBncS=input.color(#AD1457,"Colore BNC sell",group=grpGFX)
+
+// ═══ DATI HTF (15m) — barre completate ═══
+[hO, hH, hL, hC, hT] = request.security(syminfo.tickerid, htfTF, [open[1], high[1], low[1], close[1], time[1]], lookahead=barmerge.lookahead_off)
+newHTF = not na(hT) and hT != hT[1]
+pdl = request.security(syminfo.tickerid, "1D", low[1],  lookahead=barmerge.lookahead_off)
+pdh = request.security(syminfo.tickerid, "1D", high[1], lookahead=barmerge.lookahead_off)
+nqCraw = request.security(nqSym, timeframe.period, close, lookahead=barmerge.lookahead_off)
+nqC = useNQ ? nqCraw : na
+
+// ═══ arrays livelli ═══
+var array<float>  lp  = array.new_float()
+var array<string> ls  = array.new_string()
+var array<string> ll  = array.new_string()
+var array<int>    lr  = array.new_int()
+var array<bool>   lau = array.new_bool()
+var array<int>    lbn = array.new_int()
+var array<int>    lst = array.new_int()
+var array<float>  lfl = array.new_float()
+var array<int>    lfb = array.new_int()
+var array<float>  lde = array.new_float()
+var array<bool>   ldm = array.new_bool()
+var array<int>    ltc = array.new_int()
+var array<bool>   lnr = array.new_bool()
+var array<int>    ldt = array.new_int()      // ultimo step con escursione di difesa
+var array<int>    lcb = array.new_int()      // chiusure consecutive oltre il livello (flip temporale)
+var array<line>   lln = array.new_line()
+var array<label>  llb = array.new_label()
+var array<float>  b15h = array.new_float()
+var array<float>  b15l = array.new_float()
+var float lastPH15 = na
+var float lastPL15 = na
+var int   step15   = 0
+
+addLevel(float pr, string sd, string lab, int rki, bool isAuto) =>
+    dup = false
+    if array.size(lp) > 0
+        for i = 0 to array.size(lp) - 1
+            if math.abs(array.get(lp, i) - pr) <= autoTol
+                dup := true
+    if not dup
+        array.push(lp, pr), array.push(ls, sd), array.push(ll, lab), array.push(lr, rki)
+        array.push(lau, isAuto), array.push(lbn, step15)
+        array.push(lst, close > pr ? 0 : 3)
+        array.push(lfl, na), array.push(lfb, 0)
+        array.push(lde, close > pr ? high : low), array.push(ldm, false)
+        array.push(ltc, 0), array.push(lnr, false)
+        array.push(ldt, -99999)
+        array.push(lcb, 0)
+        lc = sd == "S" ? colSup : colRes
+        array.push(lln, line.new(bar_index, pr, bar_index+1, pr, extend=extend.right, color = showLevels ? color.new(lc, isAuto ? 20 : 35) : na, width = rki==2?2:1, style = isAuto ? line.style_dotted : line.style_solid))
+        array.push(llb, label.new(bar_index, pr, "", style=label.style_none, textcolor=lc, size=size.small))
+    dup
+
+removeLevel(int idx) =>
+    line.delete(array.get(lln, idx))
+    label.delete(array.get(llb, idx))
+    array.remove(lp,idx), array.remove(ls,idx), array.remove(ll,idx), array.remove(lr,idx)
+    array.remove(lau,idx), array.remove(lbn,idx), array.remove(lst,idx), array.remove(lfl,idx)
+    array.remove(lfb,idx), array.remove(lde,idx), array.remove(ldm,idx), array.remove(ltc,idx)
+    array.remove(lnr,idx), array.remove(ldt,idx), array.remove(lcb,idx), array.remove(lln,idx), array.remove(llb,idx)
+
+capAuto(string sd) =>
+    n = 0
+    old = -1
+    float far = -1.0
+    if array.size(lp) > 0
+        for i = 0 to array.size(lp) - 1
+            if array.get(lau, i) and array.get(ls, i) == sd
+                n += 1
+                d = math.abs(close - array.get(lp, i))
+                if d > far
+                    far := d
+                    old := i
+    if n > autoMax and old >= 0
+        removeLevel(old)
+
+if barstate.isfirst
+    rows = str.split(csvInput, "\n")
+    for i = 0 to array.size(rows) - 1
+        clean = str.replace_all(str.replace_all(array.get(rows,i)," ",""),"\r","")
+        if str.length(clean) > 0
+            parts = str.split(clean, ",")
+            if array.size(parts) >= 4
+                pr = str.tonumber(array.get(parts,1))
+                if not na(pr)
+                    rk = str.tonumber(array.get(parts,3))
+                    addLevel(pr, array.get(parts,0), array.get(parts,2), na(rk)?1:int(rk), false)
+
+scoreL(int i, float L, float fl, float de, int rk, bool isShort) =>
+    depth = isShort ? fl - L : L - fl
+    dd = isShort ? (na(de)?0.0:(L-de)) : (na(de)?0.0:(de-L))
+    pgold = isShort ? (not na(pdh) and math.abs(L-pdh)<=pdlTol) : (not na(pdl) and math.abs(L-pdl)<=pdlTol)
+    sc = wLevel
+    sc += pgold ? wPDL : 0.0
+    sc += math.min(dd/(defenseRally*2.0),1.0)*wDef
+    sc += math.min(array.get(ltc,i),4)*wShelf
+    sc += depth >= deepThreshold ? wDeep : wShallow
+    sc += rk==2 ? wRank : 0.0
+    m = math.min(sc,100)
+    isShort ? m*sellPenalty : m
+
+// ═══ arm attivo (scalari) ═══
+var float prevC15   = na
+var int   armIdx    = -1
+var float armLevel  = na
+var float armThr    = na
+var float armFlush  = na
+var int   armDir    = 0
+var float armScore  = na
+var int   armStamp  = 0
+armEvent = false
+
+// ═══════════  MOTORE 15m unificato — avanza per barra 15m completata  ════════
+if barstate.isconfirmed and newHTF and not na(hC)
+    h = hH
+    l = hL
+    c = hC
+    pc = na(prevC15) ? c : prevC15
+    step15 += 1
+    for i = 0 to array.size(lp) - 1
+        L  = array.get(lp,i)
+        rk = array.get(lr,i)
+        st = array.get(lst,i)
+        nn = l <= L + touchTol and h >= L - touchTol
+        if nn and not array.get(lnr,i)
+            array.set(ltc, i, array.get(ltc,i)+1)
+        array.set(lnr, i, nn)
+
+        if st == 0                                          // WATCH SOPRA
+            de = na(array.get(lde,i)) ? h : math.max(array.get(lde,i), h)
+            array.set(lde,i,de)
+            if h - L >= defenseRally
+                array.set(ldt, i, step15)
+            defended = (de - L) >= defenseRally and (defFresh <= 0 or step15 - array.get(ldt,i) <= defFresh)
+            if not defended
+                array.set(ldm,i,false)
+            if defended and not array.get(ldm,i)
+                array.set(ldm,i,true)
+            if pc >= L and l < L
+                if defended and enableLong
+                    array.set(lst,i,1), array.set(lfl,i,l), array.set(lfb,i,step15), array.set(lcb,i,0)
+                    if c > L and (L - l) >= flushMin
+                        sc = scoreL(i,L,l,de,rk,false)
+                        array.set(lst,i,2), array.set(lde,i,na), array.set(ldm,i,false)
+                        armEvent := true
+                        if armStamp != step15 or armDir != 1 or L < armLevel
+                            armIdx:=i, armLevel:=L, armThr:=L+dangerZone, armFlush:=l, armDir:=1, armScore:=sc, armStamp:=step15
+                else
+                    array.set(lst,i,3), array.set(lde,i,l), array.set(ldm,i,false)
+            else if c < L and pc < L
+                array.set(lst,i,3), array.set(lde,i,l), array.set(ldm,i,false)
+        else if st == 1                                     // FLUSH long
+            fl = math.min(array.get(lfl,i), l)
+            array.set(lfl,i,fl)
+            array.set(lcb, i, c < L ? array.get(lcb,i) + 1 : 0)
+            if c > L and (L - fl) >= flushMin
+                sc = scoreL(i,L,fl,array.get(lde,i),rk,false)
+                array.set(lst,i,2), array.set(lde,i,na), array.set(ldm,i,false)
+                armEvent := true
+                if armStamp != step15 or armDir != 1 or L < armLevel
+                    armIdx:=i, armLevel:=L, armThr:=L+dangerZone, armFlush:=fl, armDir:=1, armScore:=sc, armStamp:=step15
+            else if (acceptBars > 0 and array.get(lcb,i) >= acceptBars) or step15 - array.get(lfb,i) > maxFlushBars
+                array.set(lst,i,3), array.set(lde,i,l), array.set(ldm,i,false)
+        else if st == 2                                     // ARM LONG
+            if l < array.get(lfl,i)
+                array.set(lst,i,3), array.set(lde,i,l), array.set(ldm,i,false)
+            else if c > L + resolveMult*dangerZone
+                array.set(lst,i,0), array.set(lde,i,h), array.set(ldm,i,false)
+        else if st == 3                                     // WATCH SOTTO
+            de = na(array.get(lde,i)) ? l : math.min(array.get(lde,i), l)
+            array.set(lde,i,de)
+            if L - l >= defenseRally
+                array.set(ldt, i, step15)
+            defended = (L - de) >= defenseRally and (defFresh <= 0 or step15 - array.get(ldt,i) <= defFresh)
+            if not defended
+                array.set(ldm,i,false)
+            if defended and not array.get(ldm,i)
+                array.set(ldm,i,true)
+            if pc <= L and h > L
+                if defended and enableShort
+                    array.set(lst,i,4), array.set(lfl,i,h), array.set(lfb,i,step15), array.set(lcb,i,0)
+                    if c < L and (h - L) >= flushMin
+                        sc = scoreL(i,L,h,de,rk,true)
+                        array.set(lst,i,5), array.set(lde,i,na), array.set(ldm,i,false)
+                        armEvent := true
+                        if armStamp != step15 or armDir != -1 or L > armLevel
+                            armIdx:=i, armLevel:=L, armThr:=L-dangerZone, armFlush:=h, armDir:=-1, armScore:=sc, armStamp:=step15
+                else
+                    array.set(lst,i,0), array.set(lde,i,h), array.set(ldm,i,false)
+            else if c > L and pc > L
+                array.set(lst,i,0), array.set(lde,i,h), array.set(ldm,i,false)
+        else if st == 4                                     // BREAK short
+            fh = math.max(array.get(lfl,i), h)
+            array.set(lfl,i,fh)
+            array.set(lcb, i, c > L ? array.get(lcb,i) + 1 : 0)
+            if c < L and (fh - L) >= flushMin
+                sc = scoreL(i,L,fh,array.get(lde,i),rk,true)
+                array.set(lst,i,5), array.set(lde,i,na), array.set(ldm,i,false)
+                armEvent := true
+                if armStamp != step15 or armDir != -1 or L > armLevel
+                    armIdx:=i, armLevel:=L, armThr:=L-dangerZone, armFlush:=fh, armDir:=-1, armScore:=sc, armStamp:=step15
+            else if c > L + resolveMult*dangerZone          // ACCETTAZIONE → flip a supporto
+                array.set(lst,i,0), array.set(lde,i,h), array.set(ldm,i,false)
+            else if (acceptBars > 0 and array.get(lcb,i) >= acceptBars) or step15 - array.get(lfb,i) > maxFlushBars
+                array.set(lst,i,0), array.set(lde,i,h), array.set(ldm,i,false)
+        else if st == 5                                     // ARM SELL
+            if h > array.get(lfl,i)
+                array.set(lst,i,0), array.set(lde,i,h), array.set(ldm,i,false)
+            else if c < L - resolveMult*dangerZone
+                array.set(lst,i,3), array.set(lde,i,l), array.set(ldm,i,false)
+
+    // ── livelli automatici da pivot 15m (buffer) ──
+    array.push(b15h, h)
+    array.push(b15l, l)
+    if array.size(b15h) > 20
+        array.shift(b15h)
+        array.shift(b15l)
+    if useAuto
+        n = array.size(b15l)
+        if n >= autoPl + autoPr + 1
+            k = n - 1 - autoPr
+            cL = array.get(b15l, k)
+            cH = array.get(b15h, k)
+            isPl = true
+            isPh = true
+            for j = k - autoPl to k + autoPr
+                if j != k
+                    if array.get(b15l, j) <= cL
+                        isPl := false
+                    if array.get(b15h, j) >= cH
+                        isPh := false
+            if isPl
+                swing = na(lastPH15) ? na : lastPH15 - cL
+                if not na(swing) and swing >= swingMin
+                    if not addLevel(cL, "S", "A", 1, true)
+                        capAuto("S")
+                lastPL15 := cL
+            if isPh
+                swing2 = na(lastPL15) ? na : cH - lastPL15
+                if not na(swing2) and swing2 >= swingMin
+                    if not addLevel(cH, "R", "A", 1, true)
+                        capAuto("R")
+                lastPH15 := cH
+
+    // timeout armo + coerenza arm attivo
+    if armTimeout > 0 and armIdx >= 0 and step15 - armStamp > armTimeout
+        array.set(lst, armIdx, armDir == 1 ? 0 : 3)
+        array.set(lde, armIdx, na)
+    if armIdx >= 0 and armIdx < array.size(lst)
+        if (armDir == 1 and array.get(lst, armIdx) != 2) or (armDir == -1 and array.get(lst, armIdx) != 5)
+            armIdx := -1
+    else
+        armIdx := -1
+    prevC15 := hC
+
+armActive = armIdx >= 0
+
+// ═══════════════  CANDELE DI RIFIUTO 1min (Candle Rejection) ═══════════════
+cRng   = high - low
+cBody  = math.abs(close - open)
+cUpW   = high - math.max(open, close)
+cLoW   = math.min(open, close) - low
+cAtr   = ta.atr(14)
+cVolAv = ta.sma(volume, 20)
+cSizeOK = cSizeAtr <= 0 or cRng >= cSizeAtr * cAtr
+cVolOK  = cVolMult <= 0 or volume >= cVolAv * cVolMult
+isHam  = cRng > 0 and cSizeOK and cVolOK and cLoW >= cWickBody * cBody and cLoW >= cWickRng * cRng and cUpW <= cOppWick * cRng
+isStar = cRng > 0 and cSizeOK and cVolOK and cUpW >= cWickBody * cBody and cUpW >= cWickRng * cRng and cLoW <= cOppWick * cRng
+isLLD  = useDojiC and cRng > 0 and cSizeOK and cVolOK and cBody <= cDojiBody * cRng and cUpW >= cDojiWick * cRng and cLoW >= cDojiWick * cRng
+int bullType = isHam  ? 1 : isLLD ? 2 : 0
+int bearType = isStar ? 1 : isLLD ? 2 : 0
+
+// Cerca nelle ultime candLook barre una candela di rifiuto sul livello lvl.
+// Restituisce il nome della candela ("" se assente).
+candleConf(bool isLong, float lvl) =>
+    string res = ""
+    if not na(lvl)
+        for k = 0 to candLook - 1
+            if isLong
+                if bullType[k] > 0 and low[k] <= lvl + candTol and close[k] >= lvl
+                    res := bullType[k] == 1 ? "Hammer" : "LL Doji"
+                    break
+            else
+                if bearType[k] > 0 and high[k] >= lvl - candTol and close[k] <= lvl
+                    res := bearType[k] == 1 ? "Shooting Star" : "LL Doji"
+                    break
+    res
+
+// Candela di rifiuto su un qualunque livello (solo per la grafica)
+candAtLevel(bool isLong) =>
+    hit = false
+    if array.size(lp) > 0
+        for i = 0 to array.size(lp) - 1
+            L = array.get(lp, i)
+            if isLong ? (low <= L + candTol and close >= L) : (high >= L - candTol and close <= L)
+                hit := true
+                break
+    hit
+
+candBullLvl = showCand and candMode != "Off" and bullType > 0 and candAtLevel(true)
+candBearLvl = showCand and candMode != "Off" and bearType > 0 and candAtLevel(false)
+string fbCand  = ""
+string bncCand = ""
+var string lastCand = "—"
+
+// ═══════════════  TRIGGER 1min (FB, cicli) ═══════════════
+ema8  = ta.ema(close, emaFast)
+ema34 = ta.ema(close, emaSlow)
+emaCrossUp = ta.crossover(ema8, ema34)
+emaCrossDn = ta.crossunder(ema8, ema34)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+ph = ta.pivothigh(pivL1, pivR1)
+pl = ta.pivotlow(pivL1, pivR1)
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+var int  naCount   = 0
+var bool naOcc     = false
+var bool crossOcc  = false
+var bool swingOcc  = false
+var bool entered   = false
+var int  curStamp  = -1
+var float cycLow   = na
+var float cycHigh  = na
+entryLong  = false
+entrySell  = false
+float sigSL = na
+
+if barstate.isconfirmed and armActive
+    if armStamp != curStamp
+        curStamp := armStamp
+        naCount := 0
+        naOcc := false
+        crossOcc := false
+        swingOcc := false
+        entered := false
+        cycLow := armFlush
+        cycHigh := armFlush
+    nqOK = not useNQ ? true : na(nqC) ? true : (armDir == 1 ? nqC >= nqFloor : nqC <= nqCap)
+    if armDir == 1 and enableLong
+        if low < armLevel
+            cycLow := math.min(cycLow, low)
+        if close < armLevel
+            entered := false
+            naCount := 0
+            naOcc := false
+            crossOcc := false
+            swingOcc := false
+        else
+            naCount := close >= armThr ? naCount + 1 : 0
+            if naCount >= holdBars
+                naOcc := true
+            if emaCrossUp
+                crossOcc := true
+            if not na(lastSwingHigh) and close > lastSwingHigh
+                swingOcc := true
+            emaOcc = crossOcc and swingOcc
+            trig = trigMode == "Solo Non-Acceptance" ? naOcc : trigMode == "Solo EMA" ? emaOcc : trigMode == "Entrambi (AND)" ? (naOcc and emaOcc) : (naOcc or emaOcc)
+            chaseOK = maxChase <= 0 or (close - armLevel) <= maxChase
+            cTxt = candMode == "Off" ? "" : candleConf(true, armLevel)
+            candOK = candMode != "Obbligatoria" or cTxt != ""
+            if trig and not entered and nqOK and chaseOK and candOK
+                entered := true
+                entryLong := true
+                sigSL := cycLow - stopBuffer
+                fbCand := cTxt
+    else if armDir == -1 and enableShort
+        if high > armLevel
+            cycHigh := math.max(cycHigh, high)
+        if close > armLevel
+            entered := false
+            naCount := 0
+            naOcc := false
+            crossOcc := false
+            swingOcc := false
+        else
+            naCount := close <= armThr ? naCount + 1 : 0
+            if naCount >= holdBars
+                naOcc := true
+            if emaCrossDn
+                crossOcc := true
+            if not na(lastSwingLow) and close < lastSwingLow
+                swingOcc := true
+            emaOcc = crossOcc and swingOcc
+            trig = trigMode == "Solo Non-Acceptance" ? naOcc : trigMode == "Solo EMA" ? emaOcc : trigMode == "Entrambi (AND)" ? (naOcc and emaOcc) : (naOcc or emaOcc)
+            chaseOK = maxChase <= 0 or (armLevel - close) <= maxChase
+            cTxt = candMode == "Off" ? "" : candleConf(false, armLevel)
+            candOK = candMode != "Obbligatoria" or cTxt != ""
+            if trig and not entered and nqOK and chaseOK and candOK
+                entered := true
+                entrySell := true
+                sigSL := cycHigh + stopBuffer
+                fbCand := cTxt
+
+// ═══════════════  BNC — tocco difeso (classe B) ═══════════════
+var int   bncIdx     = -1
+var int   bncDir     = 0
+var float bncLevel   = na
+var float bncExt     = na
+var bool  bncCross   = false
+var bool  bncSwing   = false
+var bool  bncEntered = false
+entryBncLong = false
+entryBncSell = false
+float bncSL = na
+float bncScoreV = na
+
+if barstate.isconfirmed and useBNC
+    if bncIdx >= 0
+        if bncIdx >= array.size(lst)
+            bncIdx := -1
+        else
+            sb = array.get(lst, bncIdx)
+            if sb == 2 or sb == 5 or math.abs(close - bncLevel) > bncRearm
+                bncIdx := -1
+    if bncIdx == -1
+        found = -1
+        fDir  = 0
+        float bestD = 1e9
+        for i = 0 to array.size(lp) - 1
+            L  = array.get(lp,i)
+            st = array.get(lst,i)
+            de = array.get(lde,i)
+            d  = math.abs(close - L)
+            if d <= bncZone and not na(de) and d < bestD
+                fresh = defFresh <= 0 or step15 - array.get(ldt,i) <= defFresh
+                okL = (st == 0 or (bncMode == "Tocco + anticipo flush" and st == 1)) and enableLong and (de - L) >= defenseRally and fresh
+                okS = (st == 3 or (bncMode == "Tocco + anticipo flush" and st == 4)) and enableShort and (L - de) >= defenseRally and fresh
+                if okL
+                    found := i
+                    fDir := 1
+                    bestD := d
+                else if okS
+                    found := i
+                    fDir := -1
+                    bestD := d
+        if found >= 0
+            bncIdx := found
+            bncDir := fDir
+            bncLevel := array.get(lp, found)
+            bncExt := fDir == 1 ? low : high
+            bncCross := false
+            bncSwing := false
+            bncEntered := false
+    if bncIdx >= 0
+        if bncDir == 1
+            bncExt := math.min(bncExt, low)
+            if emaCrossUp
+                bncCross := true
+            if not na(lastSwingHigh) and close > lastSwingHigh
+                bncSwing := true
+            cTxtB = candMode == "Off" ? "" : candleConf(true, bncLevel)
+            if not bncEntered and bncCross and bncSwing and close > bncLevel and (candMode != "Obbligatoria" or cTxtB != "")
+                bncEntered := true
+                bncCand := cTxtB
+                entryBncLong := true
+                bncSL := bncExt - bncStopBuf
+                bncScoreV := scoreL(bncIdx, bncLevel, bncLevel, array.get(lde,bncIdx), array.get(lr,bncIdx), false) * bncFactor
+        else
+            bncExt := math.max(bncExt, high)
+            if emaCrossDn
+                bncCross := true
+            if not na(lastSwingLow) and close < lastSwingLow
+                bncSwing := true
+            cTxtB = candMode == "Off" ? "" : candleConf(false, bncLevel)
+            if not bncEntered and bncCross and bncSwing and close < bncLevel and (candMode != "Obbligatoria" or cTxtB != "")
+                bncEntered := true
+                bncCand := cTxtB
+                entryBncSell := true
+                bncSL := bncExt + bncStopBuf
+                bncScoreV := scoreL(bncIdx, bncLevel, bncLevel, array.get(lde,bncIdx), array.get(lr,bncIdx), true) * bncFactor
+
+// ═══ target level-to-level ═══
+nextAbove(float px, float d) =>
+    float best = na
+    for i = 0 to array.size(lp) - 1
+        v = array.get(lp,i)
+        if v > px + d and (na(best) or v < best)
+            best := v
+    best
+nextBelow(float px, float d) =>
+    float best = na
+    for i = 0 to array.size(lp) - 1
+        v = array.get(lp,i)
+        if v < px - d and (na(best) or v > best)
+            best := v
+    best
+
+// ═══ disegno ingressi ═══
+candNote(string c) =>
+    candMode == "Off" ? "" : "\n🕯 " + (c != "" ? c : "nessuna candela")
+
+if entryLong or entrySell
+    lastCand := candMode == "Off" ? "off" : fbCand != "" ? fbCand : "nessuna"
+if entryBncLong or entryBncSell
+    lastCand := candMode == "Off" ? "off" : bncCand != "" ? bncCand : "nessuna"
+
+if entryLong and showEntry
+    e = close
+    sl = sigSL
+    float lk = e + lockPts
+    float t1 = nextAbove(e, minTgtDist)
+    float t2 = na(t1) ? na : nextAbove(t1, minTgtDist)
+    float rr = (e - sl) > 0 and not na(t1) ? (t1 - e) / (e - sl) : na
+    txt = "▲ LONG " + str.tostring(e) + "\nSL " + str.tostring(sl) + " · Lock " + str.tostring(lk) + (na(t1)?"":" T1 " + str.tostring(t1)) + (na(t2)?"":" T2 " + str.tostring(t2)) + (na(rr)?"":" · " + str.tostring(rr,"#.0") + "R") + "\nscore " + str.tostring(int(math.round(armScore))) + candNote(fbCand)
+    label.new(bar_index, low, txt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(colSup,10), textcolor=color.white, size=size.small)
+    line.new(bar_index, sl, bar_index+8, sl, color=color.new(colRes,0), width=2)
+    line.new(bar_index, lk, bar_index+8, lk, color=color.new(color.gray,20), style=line.style_dotted)
+    if not na(t1)
+        line.new(bar_index, t1, bar_index+8, t1, color=color.new(colSup,0), style=line.style_dashed)
+if entrySell and showEntry
+    e = close
+    sl = sigSL
+    float lk = e - lockPts
+    float t1 = nextBelow(e, minTgtDist)
+    float t2 = na(t1) ? na : nextBelow(t1, minTgtDist)
+    float rr = (sl - e) > 0 and not na(t1) ? (e - t1) / (sl - e) : na
+    txt = "▼ SELL " + str.tostring(e) + "\nSL " + str.tostring(sl) + " · Lock " + str.tostring(lk) + (na(t1)?"":" T1 " + str.tostring(t1)) + (na(t2)?"":" T2 " + str.tostring(t2)) + (na(rr)?"":" · " + str.tostring(rr,"#.0") + "R") + "\nscore " + str.tostring(int(math.round(armScore))) + candNote(fbCand)
+    label.new(bar_index, high, txt, yloc=yloc.abovebar, style=label.style_label_down, color=color.new(colRes,10), textcolor=color.white, size=size.small)
+    line.new(bar_index, sl, bar_index+8, sl, color=color.new(colRes,0), width=2)
+    line.new(bar_index, lk, bar_index+8, lk, color=color.new(color.gray,20), style=line.style_dotted)
+    if not na(t1)
+        line.new(bar_index, t1, bar_index+8, t1, color=color.new(colSup,0), style=line.style_dashed)
+if entryBncLong and showEntry
+    e = close
+    sl = bncSL
+    float lk = e + lockPts
+    float t1 = nextAbove(e, minTgtDist)
+    float t2 = na(t1) ? na : nextAbove(t1, minTgtDist)
+    float rr = (e - sl) > 0 and not na(t1) ? (t1 - e) / (e - sl) : na
+    txt = "▲ BNC " + str.tostring(e) + "\nSL " + str.tostring(sl) + " · Lock " + str.tostring(lk) + (na(t1)?"":" T1 " + str.tostring(t1)) + (na(t2)?"":" T2 " + str.tostring(t2)) + (na(rr)?"":" · " + str.tostring(rr,"#.0") + "R") + "\nscore " + str.tostring(int(math.round(bncScoreV))) + candNote(bncCand)
+    label.new(bar_index, low, txt, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(colBncL,10), textcolor=color.white, size=size.small)
+    line.new(bar_index, sl, bar_index+8, sl, color=color.new(colRes,0), width=2)
+    line.new(bar_index, lk, bar_index+8, lk, color=color.new(color.gray,20), style=line.style_dotted)
+    if not na(t1)
+        line.new(bar_index, t1, bar_index+8, t1, color=color.new(colBncL,0), style=line.style_dashed)
+if entryBncSell and showEntry
+    e = close
+    sl = bncSL
+    float lk = e - lockPts
+    float t1 = nextBelow(e, minTgtDist)
+    float t2 = na(t1) ? na : nextBelow(t1, minTgtDist)
+    float rr = (sl - e) > 0 and not na(t1) ? (e - t1) / (sl - e) : na
+    txt = "▼ BNC " + str.tostring(e) + "\nSL " + str.tostring(sl) + " · Lock " + str.tostring(lk) + (na(t1)?"":" T1 " + str.tostring(t1)) + (na(t2)?"":" T2 " + str.tostring(t2)) + (na(rr)?"":" · " + str.tostring(rr,"#.0") + "R") + "\nscore " + str.tostring(int(math.round(bncScoreV))) + candNote(bncCand)
+    label.new(bar_index, high, txt, yloc=yloc.abovebar, style=label.style_label_down, color=color.new(colBncS,10), textcolor=color.white, size=size.small)
+    line.new(bar_index, sl, bar_index+8, sl, color=color.new(colRes,0), width=2)
+    line.new(bar_index, lk, bar_index+8, lk, color=color.new(color.gray,20), style=line.style_dotted)
+    if not na(t1)
+        line.new(bar_index, t1, bar_index+8, t1, color=color.new(colBncS,0), style=line.style_dashed)
+
+plotshape(candBullLvl, "Candela rifiuto rialzista sul livello", shape.circle, location.belowbar, color.new(#00C853, 35), size=size.tiny)
+plotshape(candBearLvl, "Candela rifiuto ribassista sul livello", shape.circle, location.abovebar, color.new(#D50000, 35), size=size.tiny)
+
+// ═══════════════════  E S E C U Z I O N E   S T R A T E G Y  ═══════════════════
+qLock = int(math.floor(qtyTot * pctLock / 100.0))
+qT1   = int(math.floor(qtyTot * pctT1 / 100.0))
+qT2   = qtyTot - qLock - qT1
+
+inEntrySess = not useEntrySess or not na(time(timeframe.period, entrySess, sessTz))
+isEod       = useEod and not na(time(timeframe.period, eodSess, sessTz))
+canEnter    = inEntrySess and not isEod
+
+var float trE    = na
+var float trSL   = na
+var float trLk   = na
+var float trT1   = na
+var float trT2   = na
+var int   trDir  = 0
+var bool  beDone = false
+var bool  inTrade  = false
+var int   ctStart  = 0
+var bool  trCand   = false
+var bool  trIsBnc  = false
+
+// statistiche per posizione: [n, vinte, netto]
+var array<float> stCand   = array.from(0.0, 0.0, 0.0)
+var array<float> stNoCand = array.from(0.0, 0.0, 0.0)
+var array<float> stFB     = array.from(0.0, 0.0, 0.0)
+var array<float> stBNC    = array.from(0.0, 0.0, 0.0)
+
+addStat(array<float> a, float pnl) =>
+    array.set(a, 0, array.get(a, 0) + 1)
+    array.set(a, 1, array.get(a, 1) + (pnl > 0 ? 1 : 0))
+    array.set(a, 2, array.get(a, 2) + pnl)
+
+// 1) posizione chiusa → aggrega le parziali in un'unica operazione
+if inTrade and strategy.position_size == 0 and strategy.closedtrades > ctStart
+    float pnl = 0.0
+    for i = ctStart to strategy.closedtrades - 1
+        pnl += strategy.closedtrades.profit(i)
+    addStat(trCand ? stCand : stNoCand, pnl)
+    addStat(trIsBnc ? stBNC : stFB, pnl)
+    inTrade := false
+
+// 2) chiusura forzata di fine giornata
+if isEod and strategy.position_size != 0
+    strategy.close_all(comment="EOD", immediately=true)
+
+// 3) stop a pareggio dopo il Lock (una sola volta)
+if beAfterLock and not beDone and strategy.position_size != 0 and qLock > 0
+    rem = math.abs(strategy.position_size)
+    if rem <= qT1 + qT2
+        beDone := true
+        be = strategy.position_avg_price
+        if trDir == 1
+            if rem > qT2 and qT1 > 0
+                strategy.exit("L-T1", "L", qty=qT1, limit=trT1, stop=be, comment_profit="T1", comment_loss="BE")
+            if qT2 > 0
+                strategy.exit("L-T2", "L", qty=qT2, limit=trT2, stop=be, comment_profit="T2", comment_loss="BE")
+        else
+            if rem > qT2 and qT1 > 0
+                strategy.exit("S-T1", "S", qty=qT1, limit=trT1, stop=be, comment_profit="T1", comment_loss="BE")
+            if qT2 > 0
+                strategy.exit("S-T2", "S", qty=qT2, limit=trT2, stop=be, comment_profit="T2", comment_loss="BE")
+
+// 4) nuovi ingressi (solo da flat): FB ha priorità su BNC
+flat     = strategy.position_size == 0 and not inTrade
+sigLongFB  = tradeFB  and entryLong
+sigLongBnc = tradeBNC and entryBncLong
+sigSellFB  = tradeFB  and entrySell
+sigSellBnc = tradeBNC and entryBncSell
+
+if flat and canEnter and (sigLongFB or sigLongBnc)
+    xE  = close
+    xSL = sigLongFB ? sigSL : bncSL
+    xR  = xE - xSL
+    if xR > 0
+        xLk = xE + lockPts
+        float xT1 = nextAbove(xE, math.max(minTgtDist, lockPts))
+        if na(xT1)
+            xT1 := math.max(xE + t1FallR * xR, xLk + syminfo.mintick)
+        float xT2 = nextAbove(xT1, minTgtDist)
+        if na(xT2)
+            xT2 := xT1 + (xT1 - xE)
+        tag = sigLongFB ? "FB" : "BNC"
+        strategy.entry("L", strategy.long, qty=qtyTot, comment=tag)
+        if qLock > 0
+            strategy.exit("L-Lock", "L", qty=qLock, limit=xLk, stop=xSL, comment_profit="Lock", comment_loss="SL")
+        if qT1 > 0
+            strategy.exit("L-T1",   "L", qty=qT1,   limit=xT1, stop=xSL, comment_profit="T1",   comment_loss="SL")
+        if qT2 > 0
+            strategy.exit("L-T2",   "L", qty=qT2,   limit=xT2, stop=xSL, comment_profit="T2",   comment_loss="SL")
+        trE := xE, trSL := xSL, trLk := xLk, trT1 := xT1, trT2 := xT2, trDir := 1
+        beDone := false, inTrade := true, ctStart := strategy.closedtrades
+        trIsBnc := not sigLongFB
+        trCand := (sigLongFB ? fbCand : bncCand) != ""
+else if flat and canEnter and (sigSellFB or sigSellBnc)
+    xE  = close
+    xSL = sigSellFB ? sigSL : bncSL
+    xR  = xSL - xE
+    if xR > 0
+        xLk = xE - lockPts
+        float xT1 = nextBelow(xE, math.max(minTgtDist, lockPts))
+        if na(xT1)
+            xT1 := math.min(xE - t1FallR * xR, xLk - syminfo.mintick)
+        float xT2 = nextBelow(xT1, minTgtDist)
+        if na(xT2)
+            xT2 := xT1 - (xE - xT1)
+        tag = sigSellFB ? "FBO" : "BNC"
+        strategy.entry("S", strategy.short, qty=qtyTot, comment=tag)
+        if qLock > 0
+            strategy.exit("S-Lock", "S", qty=qLock, limit=xLk, stop=xSL, comment_profit="Lock", comment_loss="SL")
+        if qT1 > 0
+            strategy.exit("S-T1",   "S", qty=qT1,   limit=xT1, stop=xSL, comment_profit="T1",   comment_loss="SL")
+        if qT2 > 0
+            strategy.exit("S-T2",   "S", qty=qT2,   limit=xT2, stop=xSL, comment_profit="T2",   comment_loss="SL")
+        trE := xE, trSL := xSL, trLk := xLk, trT1 := xT1, trT2 := xT2, trDir := -1
+        beDone := false, inTrade := true, ctStart := strategy.closedtrades
+        trIsBnc := not sigSellFB
+        trCand := (sigSellFB ? fbCand : bncCand) != ""
+
+inPos = strategy.position_size != 0
+plot(inPos ? (beDone ? strategy.position_avg_price : trSL) : na, "Stop attivo", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plot(inPos ? trLk : na, "Lock", color=color.new(color.gray, 0),  style=plot.style_linebr)
+plot(inPos ? trT1 : na, "T1",   color=color.new(color.lime, 0),  style=plot.style_linebr)
+plot(inPos ? trT2 : na, "T2",   color=color.new(color.green, 0), style=plot.style_linebr)
+
+// ═══ tabella statistiche per posizione ═══
+statTxt(array<float> a) =>
+    n = array.get(a, 0)
+    n == 0 ? "—" : str.tostring(n, "#") + " · " + str.tostring(100.0 * array.get(a, 1) / n, "#") + "% · " + str.tostring(array.get(a, 2), "#") + " $"
+
+var table stTbl = na
+if showStats and barstate.islast
+    if na(stTbl)
+        stTbl := table.new(position.bottom_right, 2, 6, frame_color=color.gray, frame_width=1, border_color=color.new(color.gray,60), border_width=1, bgcolor=color.new(color.black, 20))
+    table.cell(stTbl, 0, 0, "POSIZIONI", bgcolor=#5B4A8A, text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 1, 0, "n · win% · netto", bgcolor=#5B4A8A, text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 0, 1, "🕯 Con candela",    text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 1, 1, statTxt(stCand),    text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 0, 2, "Senza candela",     text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 1, 2, statTxt(stNoCand),  text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 0, 3, "FB / FBO",          text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 1, 3, statTxt(stFB),      text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 0, 4, "BNC",               text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 1, 4, statTxt(stBNC),     text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 0, 5, "Divisione Lock/T1/T2", text_color=color.white, text_size=size.small)
+    table.cell(stTbl, 1, 5, str.tostring(qLock) + " / " + str.tostring(qT1) + " / " + str.tostring(qT2) + (qtyTot < 4 ? "  ⚠" : ""), text_color = qtyTot < 4 ? color.orange : color.white, text_size=size.small)
+
+plot(showEMA ? ema8 : na, "EMA veloce", color=color.new(#2962FF,0), linewidth=1)
+plot(showEMA ? ema34 : na, "EMA lenta", color=color.new(#E53935,0), linewidth=1)
+plot(showArmLvl and armActive ? armLevel : na, "Livello armato", color=color.new(color.gray,0), style=plot.style_linebr, linewidth=1)
+plot(showArmLvl and armActive ? armThr : na, "Soglia L±5", color=color.new(color.orange,0), style=plot.style_linebr, linewidth=1)
+plot(showPDLH ? pdl : na, "PDL", color=color.new(#2962FF, 45), style=plot.style_linebr, linewidth=1)
+plot(showPDLH ? pdh : na, "PDH", color=color.new(#E53935, 45), style=plot.style_linebr, linewidth=1)
+var label pdlLbl = na
+var label pdhLbl = na
+if barstate.islast and showPDLH
+    if na(pdlLbl)
+        pdlLbl := label.new(bar_index, pdl, "", style=label.style_none, textcolor=color.new(#2962FF, 0), size=size.small)
+        pdhLbl := label.new(bar_index, pdh, "", style=label.style_none, textcolor=color.new(#E53935, 0), size=size.small)
+    label.set_xy(pdlLbl, bar_index + 9, pdl)
+    label.set_text(pdlLbl, "PDL " + str.tostring(pdl))
+    label.set_xy(pdhLbl, bar_index + 9, pdh)
+    label.set_text(pdhLbl, "PDH " + str.tostring(pdh))
+
+if barstate.islast
+    for i = 0 to array.size(llb) - 1
+        lb = array.get(llb, i)
+        label.set_xy(lb, bar_index + 5, array.get(lp, i))
+        label.set_text(lb, showLevelLabels ? array.get(ll, i) + "  " + str.tostring(array.get(lp, i)) : "")
+
+var table dash = na
+if showTable and barstate.islast
+    if na(dash)
+        dash := table.new(position.top_right, 2, 10, frame_color=color.gray, frame_width=1, border_color=color.new(color.gray,60), border_width=1)
+    table.cell(dash,0,0,"STADIO 2 · TRIGGER",bgcolor=#5B4A8A,text_color=color.white,text_size=size.small)
+    table.cell(dash,1,0,timeframe.period + " / " + htfTF,bgcolor=#5B4A8A,text_color=color.white,text_size=size.small)
+    table.cell(dash,0,1,"Livelli (CSV+auto)",text_size=size.small)
+    table.cell(dash,1,1,str.tostring(array.size(lp)),text_size=size.small)
+    table.cell(dash,0,2,"Arm attivo (15m)",text_size=size.small)
+    table.cell(dash,1,2, armActive ? (armDir==1?"LONG @"+str.tostring(armLevel):"SELL @"+str.tostring(armLevel)) : "—", text_size=size.small, text_color = armActive ? (armDir==1?color.green:color.red) : color.gray)
+    table.cell(dash,0,3,"Soglia L±5",text_size=size.small)
+    table.cell(dash,1,3, armActive ? str.tostring(armThr) : "—", text_size=size.small)
+    table.cell(dash,0,4,"Non-accept (barre)",text_size=size.small)
+    table.cell(dash,1,4, armActive ? str.tostring(naCount) + "/" + str.tostring(holdBars) : "—", text_size=size.small)
+    table.cell(dash,0,5,"Ciclo trigger",text_size=size.small)
+    table.cell(dash,1,5, not armActive ? "—" : entered ? "GIA' ENTRATO" : "in attesa", text_size=size.small, text_color = not armActive ? color.gray : entered ? color.orange : color.green)
+    table.cell(dash,0,6,"BNC",text_size=size.small)
+    table.cell(dash,1,6, not useBNC or bncIdx < 0 ? "—" : (bncEntered ? "entrato @" + str.tostring(bncLevel) : (bncDir==1?"tocco S @":"tocco R @") + str.tostring(bncLevel)), text_size=size.small, text_color = not useBNC or bncIdx < 0 ? color.gray : bncEntered ? color.orange : color.teal)
+    table.cell(dash,0,7,"EMA 8/34",text_size=size.small)
+    table.cell(dash,1,7, ema8 > ema34 ? "8>34 ▲" : "8<34 ▼", text_size=size.small, text_color = ema8>ema34?color.green:color.red)
+    table.cell(dash,0,8,"Score arm",text_size=size.small)
+    table.cell(dash,1,8, na(armScore) ? "—" : str.tostring(int(math.round(armScore))), text_size=size.small)
+    table.cell(dash,0,9,"Candela (" + candMode + ")",text_size=size.small)
+    table.cell(dash,1,9, lastCand, text_size=size.small, text_color = lastCand == "nessuna" ? color.orange : lastCand == "off" or lastCand == "—" ? color.gray : color.green)
+
+// alert(): in una strategy alertcondition() non e' disponibile
+tk = syminfo.ticker + " " + timeframe.period + " · close " + str.tostring(close)
+if armEvent
+    alert("ARM 15m su " + tk + " — pronti al trigger 1min", alert.freq_once_per_bar_close)
+if entryLong
+    alert("ENTRATA LONG" + (fbCand != "" ? " + " + fbCand : "") + " su " + tk, alert.freq_once_per_bar_close)
+if entrySell
+    alert("ENTRATA SELL" + (fbCand != "" ? " + " + fbCand : "") + " su " + tk, alert.freq_once_per_bar_close)
+if entryBncLong
+    alert("BNC LONG" + (bncCand != "" ? " + " + bncCand : "") + " su " + tk, alert.freq_once_per_bar_close)
+if entryBncSell
+    alert("BNC SELL" + (bncCand != "" ? " + " + bncCand : "") + " su " + tk, alert.freq_once_per_bar_close)
