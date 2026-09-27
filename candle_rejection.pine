@@ -7,7 +7,7 @@
 //  Il pattern candlestick NON è il segnale: è il trigger. Il segnale nasce
 //  solo se il pattern si forma nel contesto giusto. Ogni pattern riceve un
 //  PUNTEGGIO 0–4:
-//    +1 Location : l'ombra tocca/buca un livello (VWAP, bande VWAP, pivot)
+//    +1 Location : l'ombra tocca/buca un livello (Mancini, VWAP, bande, pivot)
 //                  e la candela chiude dal lato giusto del livello
 //    +1 Trend    : prezzo dal lato giusto dell'EMA del timeframe superiore
 //    +1 Volume   : volume > media × moltiplicatore
@@ -40,6 +40,10 @@ strategy("Candle Rejection – Hammer / Star / LL Doji",
          commission_type         = strategy.commission.cash_per_contract,
          commission_value        = 2.05,
          slippage                = 1,
+         margin_long             = 0,     // nessun controllo margine: su ES 1 contratto
+         margin_short            = 0,     // (~$390k nozionali) supera il capitale e
+                                          // con margine 100% (default v6) ogni ordine
+                                          // verrebbe rifiutato → nessun trade nel report
          pyramiding              = 0,
          process_orders_on_close = false,
          calc_on_order_fills     = false,
@@ -53,6 +57,7 @@ strategy("Candle Rejection – Hammer / Star / LL Doji",
 var string G_PAT = "🕯️ Pattern"
 var string G_FLT = "🧮 Filtri & Punteggio"
 var string G_LVL = "📍 Livelli (VWAP & Pivot)"
+var string G_MAN = "📐 Livelli Mancini"
 var string G_ENT = "🎯 Ingresso & Rischio"
 var string G_SS  = "🕐 Sessione"
 var string G_VIS = "🎨 Visuals"
@@ -102,6 +107,14 @@ i_gapAtr    = input.float (0.5,   "Pivot: distanza minima (× ATR)", minval=0.0,
               tooltip="Evita livelli duplicati troppo vicini.")
 i_tolAtr    = input.float (0.25,  "Tolleranza tocco livello (× ATR)", minval=0.0, step=0.05, group=G_LVL,
               tooltip="Quanto vicino al livello deve arrivare l'ombra per contare come tocco.")
+
+// ── Livelli Mancini ──────────────────────────────────────────────────────────
+i_useMan   = input.bool     (true, "Usa livelli Mancini", group=G_MAN)
+i_manText  = input.text_area("",   "Livelli (incolla la lista)", group=G_MAN,
+             tooltip="Incolla i livelli così come li pubblica Mancini, separati da virgola, spazio o a capo. Esempi validi: 7812, 7803.5, 7794-96 (range: vengono presi entrambi gli estremi), 7770 (major). Il testo non numerico viene ignorato. I livelli valgono sia come supporto sia come resistenza: decide la candela (ombra che tocca + chiusura dal lato giusto).")
+i_drawMan  = input.bool     (false, "Disegna livelli Mancini", group=G_MAN,
+             tooltip="Disattivato di default: se hai già l'indicatore Mancini sul grafico evita linee doppie.")
+i_colMan   = input.color    (color.new(#FFD600, 30), "Colore livelli Mancini", group=G_MAN)
 
 // ── Ingresso & Rischio ───────────────────────────────────────────────────────
 i_entryMode = input.string("Rottura max/min", "Modalità ingresso (Hammer/Star)",
@@ -208,29 +221,91 @@ if i_showLvls and array.size(lvlLines) > 0
         if not na(ln)
             line.set_x2(ln, bar_index)
 
+// ════════════════════════════════════════════════════════════════════════════
+//  L I V E L L I   M A N C I N I
+// ════════════════════════════════════════════════════════════════════════════
+// Converte il testo incollato in un array di prezzi.
+// "7794-96" → 7794 e 7796 (il secondo estremo eredita le cifre iniziali).
+f_parseLevels(string txt) =>
+    array<float> out = array.new<float>(0)
+    string clean = txt
+    for sep in array.from("\n", "\r", "\t", ",", ";", "(", ")", "/", "|")
+        clean := str.replace_all(clean, sep, " ")
+    array<string> toks = str.split(clean, " ")
+    for tok in toks
+        if str.length(tok) > 0
+            if str.contains(tok, "-")
+                array<string> parts = str.split(tok, "-")
+                if array.size(parts) >= 2
+                    float a = str.tonumber(array.get(parts, 0))
+                    float b = str.tonumber(array.get(parts, 1))
+                    if not na(a)
+                        array.push(out, a)
+                        if not na(b)
+                            if b < a
+                                float m = math.pow(10, str.length(str.tostring(math.floor(b))))
+                                b := a - (a % m) + b
+                                if b < a
+                                    b += m
+                            array.push(out, b)
+            else
+                float v = str.tonumber(tok)
+                if not na(v) and v > 0
+                    array.push(out, v)
+    out
+
+var array<float> manLvls = f_parseLevels(i_manText)
+
+if i_useMan and i_drawMan and barstate.isfirst and array.size(manLvls) > 0
+    for i = 0 to math.min(array.size(manLvls), 200) - 1
+        float l = array.get(manLvls, i)
+        line.new(bar_index, l, bar_index + 1, l, xloc=xloc.bar_index,
+             extend=extend.both, color=i_colMan, style=line.style_solid, width=1)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  L O C A T I O N
+// ════════════════════════════════════════════════════════════════════════════
 // Supporto: l'ombra inferiore arriva al livello (± tolleranza) e la candela
 // chiude sopra → rifiuto rialzista. Resistenza: specchio.
+// Restituisce il nome del livello toccato ("" se nessuno).
+// Priorità: Mancini → VWAP → Pivot.
+f_fmt(float v) => str.tostring(v, "#.##")
+
 f_supportTouch(float lo, float cl, float tol) =>
-    bool hit = false
-    if i_useVwap
-        hit := (lo <= vw + tol and cl >= vw) or (lo <= vwDn + tol and cl >= vwDn)
-    if not hit and i_usePiv and array.size(lvls) > 0
-        for i = 0 to array.size(lvls) - 1
-            float l = array.get(lvls, i)
+    string hit = ""
+    if i_useMan and array.size(manLvls) > 0
+        for l in manLvls
             if lo <= l + tol and cl >= l
-                hit := true
+                hit := "Mancini " + f_fmt(l)
+                break
+    if hit == "" and i_useVwap
+        if lo <= vw + tol and cl >= vw
+            hit := "VWAP"
+        else if lo <= vwDn + tol and cl >= vwDn
+            hit := "VWAP −σ"
+    if hit == "" and i_usePiv and array.size(lvls) > 0
+        for l in lvls
+            if lo <= l + tol and cl >= l
+                hit := "Pivot " + f_fmt(l)
                 break
     hit
 
 f_resistTouch(float hi, float cl, float tol) =>
-    bool hit = false
-    if i_useVwap
-        hit := (hi >= vw - tol and cl <= vw) or (hi >= vwUp - tol and cl <= vwUp)
-    if not hit and i_usePiv and array.size(lvls) > 0
-        for i = 0 to array.size(lvls) - 1
-            float l = array.get(lvls, i)
+    string hit = ""
+    if i_useMan and array.size(manLvls) > 0
+        for l in manLvls
             if hi >= l - tol and cl <= l
-                hit := true
+                hit := "Mancini " + f_fmt(l)
+                break
+    if hit == "" and i_useVwap
+        if hi >= vw - tol and cl <= vw
+            hit := "VWAP"
+        else if hi >= vwUp - tol and cl <= vwUp
+            hit := "VWAP +σ"
+    if hit == "" and i_usePiv and array.size(lvls) > 0
+        for l in lvls
+            if hi >= l - tol and cl <= l
+                hit := "Pivot " + f_fmt(l)
                 break
     hit
 
@@ -247,8 +322,10 @@ float htfEma = request.security(syminfo.tickerid, i_htf, ta.ema(close, i_htfLen)
 bool trendL = close > htfEma
 bool trendS = close < htfEma
 
-bool locL = f_supportTouch(low,  close, touchTol)
-bool locS = f_resistTouch (high, close, touchTol)
+string locTxtL = f_supportTouch(low,  close, touchTol)
+string locTxtS = f_resistTouch (high, close, touchTol)
+bool   locL    = locTxtL != ""
+bool   locS    = locTxtS != ""
 
 int scoreL = (locL ? 1 : 0) + (trendL ? 1 : 0) + (volOk ? 1 : 0) + (sizeOk ? 1 : 0)
 int scoreS = (locS ? 1 : 0) + (trendS ? 1 : 0) + (volOk ? 1 : 0) + (sizeOk ? 1 : 0)
@@ -378,7 +455,7 @@ if canTrade and barstate.isconfirmed and strategy.position_size == 0 and not pen
     float slS = high + i_slTicks * tick
 
     if goL
-        string txt = name + " · " + str.tostring(scoreL) + "/4"
+        string txt = name + " · " + str.tostring(scoreL) + "/4" + (locL ? "\n@ " + locTxtL : "")
         if useStop
             float trig = high + tick
             strategy.entry("L", strategy.long, stop=trig, oca_name="ENTRY", oca_type=strategy.oca.cancel)
@@ -395,7 +472,7 @@ if canTrade and barstate.isconfirmed and strategy.position_size == 0 and not pen
             f_signal(true, txt)
 
     if goS
-        string txt = name + " · " + str.tostring(scoreS) + "/4"
+        string txt = name + " · " + str.tostring(scoreS) + "/4" + (locS ? "\n@ " + locTxtS : "")
         if useStop
             float trig = low - tick
             strategy.entry("S", strategy.short, stop=trig, oca_name="ENTRY", oca_type=strategy.oca.cancel)
@@ -433,7 +510,7 @@ plotshape(setupS, "Setup short", shape.triangledown, location.abovebar, color.ne
 // ════════════════════════════════════════════════════════════════════════════
 //  P A N N E L L O
 // ════════════════════════════════════════════════════════════════════════════
-var table tbl = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 25), border_width=1)
+var table tbl = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 25), border_width=1)
 
 if i_showTable and barstate.islast
     float pct = rawCount > 0 ? 100.0 * sigCount / rawCount : 0.0
@@ -445,3 +522,5 @@ if i_showTable and barstate.islast
     table.cell(tbl, 1, 2, str.tostring(i_minScore) + "/4" + (i_locReq ? " + Loc" : ""), text_color=color.white, text_size=size.small)
     table.cell(tbl, 0, 3, "Ingresso",         text_color=color.white, text_size=size.small, text_halign=text.align_left)
     table.cell(tbl, 1, 3, i_entryMode,        text_color=color.white, text_size=size.small)
+    table.cell(tbl, 0, 4, "Livelli Mancini",  text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, i_useMan ? str.tostring(array.size(manLvls)) : "off", text_color=color.white, text_size=size.small)
