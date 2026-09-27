@@ -11,6 +11,9 @@
 //     Modalita': Off (= v1.5) · Etichetta (segnali invariati, la label dice
 //     se c'era la candela) · Obbligatoria (niente candela → niente ingresso;
 //     il ciclo resta aperto e scatta appena la candela compare nella finestra).
+//   · Pattern a 2 candele (opzionali): Hammer/Star 2-bar (fusione di due
+//     candele: open[1], max high, min low, close) e Tweezer Bottom/Top
+//     (due estremi entro N tick, candela di reazione nel verso giusto).
 //   · Pallini sulle candele di rifiuto che toccano un livello (CSV o auto).
 //   · Alert dedicati "LONG/SELL + candela".
 //  Logica del motore 15m, trigger, BNC e target: invariata rispetto a v1.5.
@@ -100,6 +103,10 @@ cDojiBody  = input.float(0.10, "Doji: corpo ≤ frazione del range", minval=0.01
 cDojiWick  = input.float(0.30, "Doji: ciascuna ombra ≥ frazione del range", minval=0.1, maxval=0.49, step=0.01, group=grpCD)
 cSizeAtr   = input.float(0.8,  "Size: range ≥ N × ATR(14) 1m (0 = off)", minval=0.0, step=0.1, group=grpCD)
 cVolMult   = input.float(0.0,  "Volume: ≥ media(20) × N (0 = off)", minval=0.0, step=0.1, group=grpCD)
+cUse2Bar   = input.bool(true,  "Hammer / Star 2-bar (fusione di 2 candele)", group=grpCD)
+cUseTw     = input.bool(true,  "Tweezer Bottom / Top", group=grpCD)
+cTwTicks   = input.int(4,      "Tweezer: differenza max tra i due estremi (tick)", minval=0, maxval=40, group=grpCD)
+cTwBars    = input.int(3,      "Tweezer: distanza max tra i due estremi (barre)", minval=1, maxval=5, group=grpCD)
 showCand   = input.bool(true,  "Mostra candele di rifiuto sui livelli", group=grpCD)
 
 grpGFX = "⑧ Grafica"
@@ -381,8 +388,58 @@ cVolOK  = cVolMult <= 0 or volume >= cVolAv * cVolMult
 isHam  = cRng > 0 and cSizeOK and cVolOK and cLoW >= cWickBody * cBody and cLoW >= cWickRng * cRng and cUpW <= cOppWick * cRng
 isStar = cRng > 0 and cSizeOK and cVolOK and cUpW >= cWickBody * cBody and cUpW >= cWickRng * cRng and cLoW <= cOppWick * cRng
 isLLD  = useDojiC and cRng > 0 and cSizeOK and cVolOK and cBody <= cDojiBody * cRng and cUpW >= cDojiWick * cRng and cLoW >= cDojiWick * cRng
-int bullType = isHam  ? 1 : isLLD ? 2 : 0
-int bearType = isStar ? 1 : isLLD ? 2 : 0
+
+// 2-bar: fusione delle ultime due candele
+m2H    = math.max(high, high[1])
+m2L    = math.min(low,  low[1])
+m2Rng  = m2H - m2L
+m2Body = math.abs(close - open[1])
+m2UpW  = m2H - math.max(open[1], close)
+m2LoW  = math.min(open[1], close) - m2L
+m2SizeOK = cSizeAtr <= 0 or m2Rng >= cSizeAtr * cAtr
+is2Ham  = cUse2Bar and not isHam  and not isHam[1]  and m2Rng > 0 and m2SizeOK and cVolOK and m2LoW >= cWickBody * m2Body and m2LoW >= cWickRng * m2Rng and m2UpW <= cOppWick * m2Rng
+is2Star = cUse2Bar and not isStar and not isStar[1] and m2Rng > 0 and m2SizeOK and cVolOK and m2UpW >= cWickBody * m2Body and m2UpW >= cWickRng * m2Rng and m2LoW <= cOppWick * m2Rng
+
+// Tweezer: due estremi uguali (± tick), barre intermedie senza superarli
+twTolP = cTwTicks * syminfo.mintick
+bool  twB  = false
+bool  twT  = false
+float twLo = na
+float twHi = na
+if cUseTw
+    for k = 1 to cTwBars
+        if not twB and math.abs(low - low[k]) <= twTolP
+            fl0 = math.max(low, low[k]) - twTolP
+            okB = true
+            if k > 1
+                for j = 1 to k - 1
+                    if low[j] < fl0
+                        okB := false
+            if okB
+                twB  := true
+                twLo := math.min(low, low[k])
+        if not twT and math.abs(high - high[k]) <= twTolP
+            ce0 = math.min(high, high[k]) + twTolP
+            okT = true
+            if k > 1
+                for j = 1 to k - 1
+                    if high[j] > ce0
+                        okT := false
+            if okT
+                twT  := true
+                twHi := math.max(high, high[k])
+isTwB = twB and cVolOK and close > open and close >= low + 0.5 * cRng
+isTwT = twT and cVolOK and close < open and close <= high - 0.5 * cRng
+
+// tipo: 1 Hammer/Star · 2 LL Doji · 3 2-bar · 4 Tweezer
+int bullType = isHam  ? 1 : is2Ham  ? 3 : isTwB ? 4 : isLLD ? 2 : 0
+int bearType = isStar ? 1 : is2Star ? 3 : isTwT ? 4 : isLLD ? 2 : 0
+// estremo del pattern (ombra) usato per il contatto con il livello
+float bullLo = bullType == 3 ? m2L : bullType == 4 ? twLo : low
+float bearHi = bearType == 3 ? m2H : bearType == 4 ? twHi : high
+
+candName(bool isLong, int t) =>
+    t == 1 ? (isLong ? "Hammer" : "Shooting Star") : t == 2 ? "LL Doji" : t == 3 ? (isLong ? "Hammer 2-bar" : "Star 2-bar") : (isLong ? "Tweezer Bottom" : "Tweezer Top")
 
 // Cerca nelle ultime candLook barre una candela di rifiuto sul livello lvl.
 // Restituisce il nome della candela ("" se assente).
@@ -391,12 +448,12 @@ candleConf(bool isLong, float lvl) =>
     if not na(lvl)
         for k = 0 to candLook - 1
             if isLong
-                if bullType[k] > 0 and low[k] <= lvl + candTol and close[k] >= lvl
-                    res := bullType[k] == 1 ? "Hammer" : "LL Doji"
+                if bullType[k] > 0 and bullLo[k] <= lvl + candTol and close[k] >= lvl
+                    res := candName(true, bullType[k])
                     break
             else
-                if bearType[k] > 0 and high[k] >= lvl - candTol and close[k] <= lvl
-                    res := bearType[k] == 1 ? "Shooting Star" : "LL Doji"
+                if bearType[k] > 0 and bearHi[k] >= lvl - candTol and close[k] <= lvl
+                    res := candName(false, bearType[k])
                     break
     res
 
@@ -406,7 +463,7 @@ candAtLevel(bool isLong) =>
     if array.size(lp) > 0
         for i = 0 to array.size(lp) - 1
             L = array.get(lp, i)
-            if isLong ? (low <= L + candTol and close >= L) : (high >= L - candTol and close <= L)
+            if isLong ? (bullLo <= L + candTol and close >= L) : (bearHi >= L - candTol and close <= L)
                 hit := true
                 break
     hit

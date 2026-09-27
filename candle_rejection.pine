@@ -17,6 +17,11 @@
 //
 //  Hammer (long)        : ombra inferiore lunga, dopo una discesa
 //  Shooting Star (short): ombra superiore lunga, dopo una salita
+//  Hammer / Star 2-bar  : rifiuto spezzato su due candele. Le due barre
+//                         vengono fuse (open[1], max high, min low, close) e
+//                         la candela risultante deve avere la forma giusta
+//  Tweezer Bottom / Top : due minimi (massimi) entro N tick nelle ultime
+//                         barre, candela attuale di reazione nel verso giusto
 //  Long Legged Doji     : indecisione, NON direzionale → sempre in modalità
 //                         rottura: BUY sopra il massimo / SELL sotto il minimo
 //                         (ordini OCO: uno scatta, l'altro si cancella)
@@ -81,6 +86,14 @@ i_dojiWick = input.float (0.30, "Doji: ciascuna ombra ≥ frazione del range",
              minval=0.1, maxval=0.49, step=0.01, group=G_PAT)
 i_dojiAtr  = input.float (1.2,  "Doji: range ≥ N × ATR (gambe lunghe)",
              minval=0.1, step=0.1, group=G_PAT)
+i_use2Bar  = input.bool  (true, "Hammer / Star 2-bar (fusione di 2 candele)", group=G_PAT,
+             tooltip="Riconosce il rifiuto spezzato su due candele: open della prima, massimo e minimo delle due, close della seconda. Etichetta '2-bar'.")
+i_useTw    = input.bool  (true, "Tweezer Bottom / Top",   group=G_PAT)
+i_twTicks  = input.int   (4,    "Tweezer: differenza max tra i due estremi (tick)",
+             minval=0, maxval=40, group=G_PAT)
+i_twBars   = input.int   (3,    "Tweezer: distanza max tra i due estremi (barre)",
+             minval=1, maxval=5, group=G_PAT,
+             tooltip="1 = tweezer classico su candele adiacenti. Le barre in mezzo non devono superare i due estremi.")
 
 // ── Filtri & Punteggio ───────────────────────────────────────────────────────
 i_atrLen   = input.int   (14,   "ATR periodo",                     minval=1,   group=G_FLT)
@@ -166,6 +179,61 @@ bool isStar   = i_useStar and rng > 0 and upBefore
      and upW >= i_wickBody * body and upW >= i_wickRng * rng and loW <= i_oppWick * rng
 bool isDoji   = i_useDoji and rng > 0 and rng >= i_dojiAtr * atr
      and body <= i_dojiBody * rng and upW >= i_dojiWick * rng and loW >= i_dojiWick * rng
+
+// ── 2-bar: fusione delle ultime due candele ──
+float mH    = math.max(high, high[1])
+float mL    = math.min(low,  low[1])
+float mRng  = mH - mL
+float mBody = math.abs(close - open[1])
+float mUpW  = mH - math.max(open[1], close)
+float mLoW  = math.min(open[1], close) - mL
+bool  down2 = close[2] < close[2 + i_prevBars]
+bool  up2   = close[2] > close[2 + i_prevBars]
+
+bool is2Ham  = i_use2Bar and not isHammer and not isHammer[1] and mRng > 0 and down2
+     and mLoW >= i_wickBody * mBody and mLoW >= i_wickRng * mRng and mUpW <= i_oppWick * mRng
+bool is2Star = i_use2Bar and not isStar and not isStar[1] and mRng > 0 and up2
+     and mUpW >= i_wickBody * mBody and mUpW >= i_wickRng * mRng and mLoW <= i_oppWick * mRng
+
+// ── Tweezer: due estremi uguali (± tick) con reazione ──
+float twTol = i_twTicks * syminfo.mintick
+bool  twB   = false
+bool  twT   = false
+float twLo  = na
+float twHi  = na
+if i_useTw
+    for k = 1 to i_twBars
+        if not twB and math.abs(low - low[k]) <= twTol
+            float floorLo = math.max(low, low[k]) - twTol
+            bool  clean   = true
+            if k > 1
+                for j = 1 to k - 1
+                    if low[j] < floorLo
+                        clean := false
+            if clean
+                twB  := true
+                twLo := math.min(low, low[k])
+        if not twT and math.abs(high - high[k]) <= twTol
+            float ceilHi = math.min(high, high[k]) + twTol
+            bool  cleanH = true
+            if k > 1
+                for j = 1 to k - 1
+                    if high[j] > ceilHi
+                        cleanH := false
+            if cleanH
+                twT  := true
+                twHi := math.max(high, high[k])
+bool isTwB = twB and downBefore and close > open and close >= low + 0.5 * rng
+bool isTwT = twT and upBefore   and close < open and close <= high - 0.5 * rng
+
+// ── Candidato per lato: nome ed estremi del pattern (priorità: 1 candela →
+//    2-bar → tweezer). Senza pattern valgono low/high della barra (doji). ──
+string candL = isHammer ? "Hammer" : is2Ham ? "Hammer 2-bar" : isTwB ? "Tweezer Bottom" : ""
+string candS = isStar ? "Shooting Star" : is2Star ? "Star 2-bar" : isTwT ? "Tweezer Top" : ""
+float  pLoL  = is2Ham and not isHammer ? mL : isTwB and not isHammer ? twLo : low
+float  pHiL  = is2Ham and not isHammer ? mH : high
+float  pHiS  = is2Star and not isStar ? mH : isTwT and not isStar ? twHi : high
+float  pLoS  = is2Star and not isStar ? mL : low
 
 // ════════════════════════════════════════════════════════════════════════════
 //  S E S S I O N E
@@ -314,7 +382,8 @@ f_resistTouch(float hi, float cl, float tol) =>
 // ════════════════════════════════════════════════════════════════════════════
 float touchTol = i_tolAtr * atr
 bool  volOk  = volume > ta.sma(volume, i_volLen) * i_volMult
-bool  sizeOk = rng >= i_sizeAtr * atr
+bool  sizeOkL = (pHiL - pLoL) >= i_sizeAtr * atr
+bool  sizeOkS = (pHiS - pLoS) >= i_sizeAtr * atr
 
 // EMA HTF dell'ultima barra HTF chiusa → nessun repaint
 float htfEma = request.security(syminfo.tickerid, i_htf, ta.ema(close, i_htfLen)[1],
@@ -322,13 +391,13 @@ float htfEma = request.security(syminfo.tickerid, i_htf, ta.ema(close, i_htfLen)
 bool trendL = close > htfEma
 bool trendS = close < htfEma
 
-string locTxtL = f_supportTouch(low,  close, touchTol)
-string locTxtS = f_resistTouch (high, close, touchTol)
+string locTxtL = f_supportTouch(pLoL, close, touchTol)
+string locTxtS = f_resistTouch (pHiS, close, touchTol)
 bool   locL    = locTxtL != ""
 bool   locS    = locTxtS != ""
 
-int scoreL = (locL ? 1 : 0) + (trendL ? 1 : 0) + (volOk ? 1 : 0) + (sizeOk ? 1 : 0)
-int scoreS = (locS ? 1 : 0) + (trendS ? 1 : 0) + (volOk ? 1 : 0) + (sizeOk ? 1 : 0)
+int scoreL = (locL ? 1 : 0) + (trendL ? 1 : 0) + (volOk ? 1 : 0) + (sizeOkL ? 1 : 0)
+int scoreS = (locS ? 1 : 0) + (trendS ? 1 : 0) + (volOk ? 1 : 0) + (sizeOkS ? 1 : 0)
 
 bool passL = scoreL >= i_minScore and (not i_locReq or locL)
 bool passS = scoreS >= i_minScore and (not i_locReq or locS)
@@ -423,8 +492,8 @@ if pendS and strategy.position_size == 0
 //  3 )  N U O V I   S E T U P
 // ════════════════════════════════════════════════════════════════════════════
 bool breakMode = i_entryMode == "Rottura max/min"
-bool anyRaw    = isHammer or isStar or isDoji
-bool anyPass   = (isHammer and passL) or (isStar and passS) or (isDoji and (passL or passS))
+bool anyRaw    = candL != "" or candS != "" or isDoji
+bool anyPass   = (candL != "" and passL) or (candS != "" and passS) or (isDoji and (passL or passS))
 
 if canTrade and barstate.isconfirmed
     if anyRaw
@@ -439,25 +508,25 @@ if canTrade and barstate.isconfirmed and strategy.position_size == 0 and not pen
     bool   goL  = false
     bool   goS  = false
     string name = ""
-    if isHammer and passL
+    if candL != "" and passL
         goL  := true
-        name := "Hammer"
-    else if isStar and passS
+        name := candL
+    else if candS != "" and passS
         goS  := true
-        name := "Shooting Star"
+        name := candS
     else if isDoji
         goL  := passL
         goS  := passS
         name := "LL Doji"
 
-    bool useStop = breakMode or isDoji
-    float slL = low  - i_slTicks * tick
-    float slS = high + i_slTicks * tick
+    bool useStop = breakMode or name == "LL Doji"
+    float slL = pLoL - i_slTicks * tick
+    float slS = pHiS + i_slTicks * tick
 
     if goL
         string txt = name + " · " + str.tostring(scoreL) + "/4" + (locL ? "\n@ " + locTxtL : "")
         if useStop
-            float trig = high + tick
+            float trig = pHiL + tick
             strategy.entry("L", strategy.long, stop=trig, oca_name="ENTRY", oca_type=strategy.oca.cancel)
             strategy.exit("L-X", from_entry="L", stop=slL, limit=trig + i_rr * (trig - slL))
             pendL    := true
@@ -474,7 +543,7 @@ if canTrade and barstate.isconfirmed and strategy.position_size == 0 and not pen
     if goS
         string txt = name + " · " + str.tostring(scoreS) + "/4" + (locS ? "\n@ " + locTxtS : "")
         if useStop
-            float trig = low - tick
+            float trig = pLoS - tick
             strategy.entry("S", strategy.short, stop=trig, oca_name="ENTRY", oca_type=strategy.oca.cancel)
             strategy.exit("S-X", from_entry="S", stop=slS, limit=trig - i_rr * (slS - trig))
             pendS    := true
@@ -501,6 +570,10 @@ plot(strategy.position_size != 0 ? curTP : na, "Target", color=color.lime, style
 // Pattern grezzi (senza filtri): mostrano quanto rumore scarta il punteggio
 plotshape(i_showRaw and isHammer, "Hammer grezzo",        shape.circle,  location.belowbar, color.new(#00C853, 50), size=size.tiny)
 plotshape(i_showRaw and isStar,   "Shooting Star grezza", shape.circle,  location.abovebar, color.new(#D50000, 50), size=size.tiny)
+plotshape(i_showRaw and is2Ham,   "Hammer 2-bar grezzo",  shape.square,  location.belowbar, color.new(#00C853, 50), size=size.tiny)
+plotshape(i_showRaw and is2Star,  "Star 2-bar grezza",    shape.square,  location.abovebar, color.new(#D50000, 50), size=size.tiny)
+plotshape(i_showRaw and isTwB and not isHammer and not is2Ham,  "Tweezer Bottom grezzo", shape.cross, location.belowbar, color.new(#00C853, 30), size=size.tiny)
+plotshape(i_showRaw and isTwT and not isStar and not is2Star,   "Tweezer Top grezzo",    shape.cross, location.abovebar, color.new(#D50000, 30), size=size.tiny)
 plotshape(i_showRaw and isDoji,   "LL Doji grezzo",       shape.diamond, location.abovebar, color.new(color.gray, 30), size=size.tiny)
 
 // Setup in attesa di rottura
